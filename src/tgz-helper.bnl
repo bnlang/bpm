@@ -1,0 +1,195 @@
+ধ্রুবক fs = প্রয়োজন("fs");
+ধ্রুবক path = প্রয়োজন("path");
+ধ্রুবক zlib = প্রয়োজন("zlib");
+ধ্রুবক { Buffer } = প্রয়োজন("buffer");
+
+ফাংশন ensureDir(p) {
+    যদি (!fs.existsSync(p)) {
+        fs.mkdirSync(p, { recursive: true });
+    }
+}
+ফাংশন norm(p) {
+    // tar paths use forward slashes
+    ফেরত p.split(path.sep).join('/');
+}
+
+ফাংশন makeMatcher(excludes = []) {
+    ধ্রুবক tests = (Array.isArray(excludes) ? excludes : [excludes]).map((x) => {
+        যদি (typeof x === 'ফাংশন') ফেরত x;
+        যদি (x instanceof RegExp) ফেরত (p) => x.test(p);
+        // simple glob-ish: supports "*" wildcard and "**" প্রতি any depth
+        ধ্রুবক s = String(x).replace(/[.+^${}()|[\]\\]/g, '\\$&')
+            .replace(/\*\*/g, '.__STARSTAR__.')
+            .replace(/\*/g, '[^/]*')
+            .replace(/\.__STARSTAR__\./g, '.*');
+        ধ্রুবক re = new RegExp('^' + s + '$');
+        ফেরত (p) => re.test(p);
+    });
+
+    ফেরত (rel) => {
+        ধ্রুবক p = norm(rel);
+        // test both full path and each segment prefix (so "dir/**" can drop whole subtree)
+        যদি (tests.some((t) => t(p))) ফেরত true;
+        // also allow excluding by top-level folder/file name
+        ধ্রুবক parts = p.split('/');
+        ধরি acc = '';
+        প্রতি (ধরি i = 0; i < parts.length; i++) {
+            acc = acc ? acc + '/' + parts[i] : parts[i];
+            যদি (tests.some((t) => t(acc))) ফেরত true;
+        }
+        ফেরত false;
+    };
+}
+
+ফাংশন parseHeader(block) {
+    // Empty header (tar end marker)
+    যদি (block.every((b) => b === 0)) ফেরত null;
+
+    ধ্রুবক name = block.slice(0, 100).toString("utf8").replace(/\0.*$/, "");
+    ধ্রুবক sizeOctal = block.slice(124, 136).toString().replace(/\0.*$/, "");
+    ধ্রুবক typeflag = block[156];
+    ধ্রুবক size = parseInt(sizeOctal.trim() || "0", 8);
+
+    ফেরত { name, size, typeflag };
+}
+
+ফাংশন createTarHeader(tarPath, stats) {
+  ধ্রুবক header = Buffer.alloc(512, 0);
+  ধ্রুবক nameBuf = Buffer.from(tarPath, "utf8");
+  nameBuf.copy(header, 0, 0, Math.min(nameBuf.length, 100));
+
+  ধ্রুবক isDir = stats.isDirectory();
+  header.write(isDir ? "5" : "0", 156);
+  header.write((stats.mode & 0o7777).toString(8).padStart(7, "0"), 100);
+  header.write((stats.uid ?? 0).toString(8).padStart(7, "0"), 108);
+  header.write((stats.gid ?? 0).toString(8).padStart(7, "0"), 116);
+  header.write((isDir ? 0 : stats.size).toString(8).padStart(11, "0"), 124);
+  header.write(Math.floor(stats.mtime.getTime() / 1000).toString(8).padStart(11, "0"), 136);
+
+  // checksum
+  প্রতি (ধরি i = 148; i < 156; i++) header[i] = 32;
+  ধরি sum = 0; প্রতি (ধরি i = 0; i < 512; i++) sum += header[i];
+  header.write(sum.toString(8).padStart(6, "0") + "\0 ", 148);
+
+  ফেরত header;
+}
+
+অসমলয় ফাংশন addToTar(folder, base, out, options = {}) {
+  ধ্রুবক isExcluded = makeMatcher(options.excludes || options.exclude);
+  ধ্রুবক entries = fs.readdirSync(folder, { withFileTypes: true });
+
+  প্রতি (ধ্রুবক entry of entries) {
+    ধ্রুবক fullPath = path.join(folder, entry.name);
+    ধ্রুবক relPath = path.relative(base, fullPath);
+    যদি (isExcluded(relPath)) continue;
+
+    ধ্রুবক stats = fs.statSync(fullPath);
+    // convert to POSIX path প্রতি tar:
+    ধরি tarPath = norm(relPath);
+    যদি (stats.isDirectory() && !tarPath.endsWith("/")) tarPath += "/";
+
+    ধ্রুবক header = createTarHeader(tarPath, stats);
+    out.write(header);
+
+    যদি (stats.isFile()) {
+      ধ্রুবক fileStream = fs.createReadStream(fullPath);
+      অপেক্ষা new Promise((resolve, reject) => {
+        fileStream.on("error", reject);
+        fileStream.on("end", () => {
+          ধ্রুবক remainder = stats.size % 512;
+          যদি (remainder > 0) out.write(Buffer.alloc(512 - remainder));
+          resolve();
+        });
+        fileStream.pipe(out, { end: false });
+      });
+    } নাহলে যদি (stats.isDirectory()) {
+      অপেক্ষা addToTar(fullPath, base, out, options);
+    }
+  }
+}
+
+অসমলয় ফাংশন compressFolderToTgz(folderPath, tgzPath, options = {}) {
+    ফেরত new Promise(অসমলয় (resolve, reject) => {
+        ধ্রুবক out = fs.createWriteStream(tgzPath);
+        ধ্রুবক gzip = zlib.createGzip()
+        gzip.pipe(out);
+
+        চেষ্টা {
+            অপেক্ষা addToTar(folderPath, folderPath, gzip, options);
+            gzip.write(Buffer.alloc(1024));
+            gzip.end();
+            out.on('finish', resolve);
+        } ধরুন (err) {
+            reject(err);
+        }
+    });
+}
+
+ফাংশন safeJoin(base, unsafeRel) {
+  // convert \ -> / first
+  ধ্রুবক relPosix = unsafeRel.replace(/\\/g, "/");
+  // remove leading slashes
+  ধ্রুবক clean = relPosix.replace(/^\/+/, "");
+  // prevent traversal
+  ধ্রুবক normalized = path.normalize(clean);
+  যদি (normalized.startsWith("..") || path.isAbsolute(normalized)) {
+    নিক্ষেপ new Error(`Blocked path traversal: ${unsafeRel}`);
+  }
+  ফেরত path.join(base, normalized);
+}
+
+অসমলয় ফাংশন extractTgz(tgzPath, outDir) {
+  ফেরত new Promise((resolve, reject) => {
+    ধ্রুবক gunzip = zlib.createGunzip();
+    ধ্রুবক inStream = fs.createReadStream(tgzPath);
+    ধরি buffer = Buffer.alloc(0);
+    ধরি zeroBlocks = 0;
+
+    gunzip.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+
+      যতক্ষণ (buffer.length >= 512) {
+        ধ্রুবক headerBlock = buffer.slice(0, 512);
+
+        ধ্রুবক allZero = headerBlock.every((b) => b === 0);
+        যদি (allZero) {
+          buffer = buffer.slice(512);
+          zeroBlocks++;
+          যদি (zeroBlocks >= 2) ফেরত;
+          continue;
+        }
+        zeroBlocks = 0;
+
+        ধ্রুবক header = parseHeader(headerBlock);
+        যদি (!header) ফেরত;
+
+        ধ্রুবক { name, size, typeflag } = header;
+        ধ্রুবক fileBlockSize = Math.ceil(size / 512) * 512;
+        যদি (buffer.length < 512 + fileBlockSize) ফেরত;
+
+        buffer = buffer.slice(512);
+        ধ্রুবক fileData = buffer.slice(0, size);
+        buffer = buffer.slice(fileBlockSize);
+
+        ধ্রুবক outPath = safeJoin(outDir, name);
+
+        যদি (typeflag === 53 /* '5' */) {
+          ensureDir(outPath);
+        } নাহলে যদি (typeflag === 48 /* '0' */ || typeflag === 0) {
+          ensureDir(path.dirname(outPath));
+          fs.writeFileSync(outPath, fileData);
+        }
+      }
+    });
+
+    gunzip.on("end", () => resolve());
+    gunzip.on("error", reject);
+    inStream.on("error", reject);
+    inStream.pipe(gunzip);
+  });
+}
+
+module.exports = {
+    compressFolderToTgz,
+    extractTgz,
+}

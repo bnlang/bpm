@@ -1,0 +1,263 @@
+'use strict';
+
+ধ্রুবক fs = প্রয়োজন('fs');
+ধ্রুবক crypto = প্রয়োজন('crypto');
+ধ্রুবক { spawn } = প্রয়োজন('child_process');
+ধ্রুবক path = প্রয়োজন('path');
+ধ্রুবক { fetch } = প্রয়োজন('fetch');
+ধ্রুবক { Buffer } = প্রয়োজন('buffer');
+
+অসমলয় ফাংশন ensureFile(p, initial) {
+  চেষ্টা {
+    fs.statSync(p);
+  } ধরুন (err) {
+    ধ্রুবক dir = path.dirname(p);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(initial, null, 2));
+  }
+}
+
+অসমলয় ফাংশন readJSON(p, optional = false) {
+  চেষ্টা {
+    ধ্রুবক result = JSON.parse(fs.readFileSync(p, { encoding: 'utf8' }));
+    ফেরত result;
+  } ধরুন (e) {
+    যদি (optional) ফেরত null;
+    নিক্ষেপ e;
+  }
+}
+
+অসমলয় ফাংশন writeJSON(p, obj) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(obj, null, 2));
+}
+
+অসমলয় ফাংশন sha512OfFile(filePath) {
+  ফেরত new Promise((resolve, reject) => {
+    ধ্রুবক h = crypto.createHash('sha512');
+    ধ্রুবক s = fs.createReadStream(filePath);
+    s.on('error', reject);
+    s.on('data', (d) => h.update(d));
+    s.on('end', () => resolve('sha512-' + h.digest('base64')));
+  });
+}
+
+অসমলয় ফাংশন httpJson(url, method = 'GET', body, token) {
+  ধ্রুবক headers = { 'Content-Type': 'application/json' };
+  যদি (token) headers['Authorization'] = `Bearer ${token}`;
+  ধ্রুবক res = অপেক্ষা fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  যদি (!res.ok) {
+    ধ্রুবক text = অপেক্ষা res.text().ধরুন(() => '');
+    নিক্ষেপ new Error(`${method} ${url} -> ${res.status} ${res.statusText} ${text}`);
+  }
+  ফেরত res.json();
+}
+
+অসমলয় ফাংশন httpGetStreamToFile(url, filePath, token) {
+  ধ্রুবক headers = {}; যদি (token) headers['Authorization'] = `Bearer ${token}`;
+  ধ্রুবক res = অপেক্ষা fetch(url, { headers });
+  যদি (!res.ok) নিক্ষেপ new Error(`GET ${url} -> ${res.status}`);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+
+  ধ্রুবক out = fs.createWriteStream(filePath);
+  ধ্রুবক reader = res.body.getReader();
+
+  ফেরত new Promise((resolve, reject) => {
+    ফাংশন pump() {
+      reader.read().then(({ done, value }) => {
+        যদি (done) { out.end(); resolve(); ফেরত; }
+        out.write(Buffer.from(value), pump);
+      }).ধরুন(reject);
+    }
+    pump();
+  });
+}
+
+ফাংশন parseSpec(spec) {
+  ধরি name = spec, range = 'latest';
+  ধ্রুবক at = spec.lastIndexOf('@');
+  যদি (at > 0) { name = spec.slice(0, at); range = spec.slice(at + 1); }
+  ফেরত { name, range };
+}
+
+অসমলয় ফাংশন saveConfig(CFG_PATH, cfg) {
+  অপেক্ষা writeJSON(CFG_PATH, cfg);
+}
+
+ফাংশন parseArgs(argv) {
+  ধ্রুবক args = { _: [] };
+  প্রতি (ধরি i = 2; i < argv.length; i++) {
+    ধ্রুবক a = argv[i];
+    যদি (a === '-g' || a === '--global') args.global = true;
+    নাহলে যদি (a === '-u' || a === '--username') args.username = argv[++i];
+    নাহলে যদি (a === '-p' || a === '--password') args.password = argv[++i];
+    নাহলে যদি (a === '--registry') args.registry = argv[++i];
+    নাহলে যদি (a === '--save-dev' || a === '-D') args.saveDev = true;
+    নাহলে args._.push(a);
+  }
+  ফেরত args;
+}
+
+ফাংশন renderWindowsCmdShim_dp0_rel(relScriptFromBin) {
+  ফেরত [
+    '@ECHO OFF',
+    'GOTO start',
+    '',
+    ':find_dp0',
+    'SET dp0=%~dp0',
+    'EXIT /b',
+    '',
+    ':start',
+    'SETLOCAL',
+    'CALL :find_dp0',
+    '',
+    'REM Prefer bnl.exe beside the shim; নাহলে rely on PATH',
+    'IF EXIST "%dp0%\\bnl.exe" (',
+    '  SET "_prog=%dp0%\\bnl.exe"',
+    ') ELSE (',
+    '  SET "_prog=bnl"',
+    '  SET PATHEXT=%PATHEXT:;.JS;=;%',
+    ')',
+    '',
+    `SET "SCRIPT=%dp0%\\${relScriptFromBin.replace(/\//g, '\\')}"`,
+    'IF NOT EXIST "%SCRIPT%" (',
+    '  ECHO bpm script not found: "%SCRIPT%"',
+    '  EXIT /B 1',
+    ')',
+    '',
+    'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%" "%SCRIPT%" %*',
+    ''
+  ].join('\r\n');
+}
+
+/** Windows .ps1 with $basedir discovery; SCRIPT is relative to $basedir */
+ফাংশন renderWindowsPs1Shim_dp0_rel(relScriptFromBinWin) {
+  // Use Join-Path to combine $basedir with the Windows-style relative path
+  ফেরত [
+    '#!/usr/bin/env pwsh',
+    '$ErrorActionPreference = "Stop"',
+    '$basedir = Split-Path $MyInvocation.MyCommand.Definition -Parent',
+    '',
+    '$exe = Join-Path $basedir "bnl.exe"',
+    'if (-not (Test-Path $exe)) {',
+    '  $exe = "bnl"',
+    '  if ($PSVersionTable.PSVersion -lt "6.0" -or $IsWindows) {',
+    '    if (-not $exe.EndsWith(".exe")) { $exe = "$exe.exe" }',
+    '  }',
+    '}',
+    '',
+    `$script = Join-Path $basedir "${relScriptFromBinWin.replace(/\//g, '\\')}"`,
+    'if (!(Test-Path $script)) {',
+    '  Write-Error "bpm script not found: $script"',
+    '  exit 1',
+    '}',
+    '',
+    '$ret = 0',
+    'if ($MyInvocation.ExpectingInput) {',
+    '  $input | & $exe $script @args',
+    '  $ret = $LASTEXITCODE',
+    '} else {',
+    '  & $exe $script @args',
+    '  $ret = $LASTEXITCODE',
+    '}',
+    'exit $ret',
+    ''
+  ].join('\n');
+}
+
+/** POSIX shim; SCRIPT is relative to $basedir (dir of the shim) */
+ফাংশন renderUnixShim_dp0_rel(relScriptFromBinPosix) {
+  ফেরত [
+    '#!/usr/bin/env sh',
+    `SCRIPT="$(dirname "$0")/${relScriptFromBinPosix}"`,
+    `exec bnl "$SCRIPT" "$@"`,
+    ''
+  ].join('\n');
+}
+
+/* ------------------------------ link bins --------------------------------- */
+অসমলয় ফাংশন linkBins(pkgName, binField, pkgDir, targetDir) {
+  ধ্রুবক bins = typeof binField === 'string' ? { [pkgName]: binField } : binField;
+  যদি (!bins || typeof bins !== 'object') ফেরত 0;
+
+  fs.mkdirSync(targetDir, { recursive: true });
+  ধরি count = 0;
+  ধ্রুবক isWin = process.platform === 'win32';
+
+  প্রতি (ধ্রুবক [cmd, rel] of Object.entries(bins)) {
+    ধ্রুবক scriptAbs = path.resolve(pkgDir, rel);
+
+    // Compute the script path relative to the *bin* folder
+    ধ্রুবক relFromBin = path.relative(targetDir, scriptAbs);
+
+    যদি (isWin) {
+      // Windows prefers backslashes in relative paths
+      ধ্রুবক relWin = relFromBin.split(path.sep).join('\\');
+
+      // .cmd
+      ধ্রুবক cmdPath = path.join(targetDir, `${cmd}.cmd`);
+      চেষ্টা { fs.rmSync(cmdPath, { force: true }); } ধরুন {}
+      fs.writeFileSync(cmdPath, renderWindowsCmdShim_dp0_rel(relWin), { mode: 0o755 });
+
+      // .ps1
+      ধ্রুবক ps1Path = path.join(targetDir, `${cmd}.ps1`);
+      চেষ্টা { fs.rmSync(ps1Path, { force: true }); } ধরুন {}
+      fs.writeFileSync(ps1Path, renderWindowsPs1Shim_dp0_rel(relWin), { mode: 0o755 });
+
+      count += 2;
+    } নাহলে {
+      // POSIX prefers forward slashes
+      ধ্রুবক relPosix = relFromBin.split(path.sep).join('/');
+
+      ধ্রুবক shimPath = path.join(targetDir, cmd);
+      চেষ্টা { fs.rmSync(shimPath, { force: true }); } ধরুন {}
+      fs.writeFileSync(shimPath, renderUnixShim_dp0_rel(relPosix), { mode: 0o755 });
+      চেষ্টা { fs.chmodSync(shimPath, 0o755); } ধরুন {}
+      count += 1;
+    }
+  }
+  ফেরত count;
+}
+
+ফাংশন isWindows() {
+  ফেরত process.platform === 'win32';
+}
+
+ফাংশন spawnScriptP(command, opts = {}) {
+  ধ্রুবক isWin = process.platform === 'win32';
+  ধ্রুবক shellFile = isWin ? (process.env.ComSpec || process.env.Comspec || 'cmd.exe') : '/bin/sh';
+  ধ্রুবক shellArgs = isWin ? ['/d', '/s', '/c', command] : ['-c', command];
+
+  ফেরত new Promise((resolve, reject) => {
+    ধ্রুবক child = spawn(shellFile, shellArgs, {
+      cwd: opts.cwd || process.cwd(),
+      env: opts.env || process.env,
+    });
+    যদি (child.stdout) child.stdout.on('data', (chunk) => process.stdout.write(chunk));
+    যদি (child.stderr) child.stderr.on('data', (chunk) => process.stderr.write(chunk));
+
+    child.on('error', reject);
+    child.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`script exited with ${code}`)));
+  });
+}
+
+ফাংশন getExtraArgsAfterDashDash() {
+  ধ্রুবক idx = process.argv.indexOf('--');
+  ফেরত idx === -1 ? [] : process.argv.slice(idx + 1);
+}
+
+module.exports = {
+  ensureFile,
+  sha512OfFile,
+  httpJson,
+  httpGetStreamToFile,
+  parseSpec,
+  saveConfig,
+  parseArgs,
+  linkBins,
+  readJSON,
+  writeJSON,
+  isWindows,
+  spawnScriptP,
+  getExtraArgsAfterDashDash,
+};

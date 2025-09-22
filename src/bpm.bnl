@@ -1,0 +1,635 @@
+'use strict';
+
+ধ্রুবক fs = প্রয়োজন('fs');
+ধ্রুবক path = প্রয়োজন('path');
+ধ্রুবক os = প্রয়োজন('os');
+ধ্রুবক { URL } = প্রয়োজন('url');
+ধ্রুবক { fetch } = প্রয়োজন('fetch');
+ধ্রুবক { FormData } = প্রয়োজন('formdata');
+ধ্রুবক { Blob } = প্রয়োজন('blob');
+ধ্রুবক packageJson = প্রয়োজন('../bnl_package.json');
+
+ধ্রুবক {
+  writeJSON,
+  ensureFile,
+  readJSON,
+  sha512OfFile,
+  httpJson,
+  httpGetStreamToFile,
+  parseSpec,
+  saveConfig,
+  parseArgs,
+  linkBins,
+  isWindows,
+  spawnScriptP,
+  getExtraArgsAfterDashDash,
+} = প্রয়োজন('./utils.bnl');
+ধ্রুবক { extractTgz, compressFolderToTgz } = প্রয়োজন('./tgz-helper.bnl');
+
+ধ্রুবক HOME = os.homedir();
+ধ্রুবক CFG_PATH = path.join(HOME, '.bpmrc.json');
+ধ্রুবক IS_WIN = process.platform === 'win32';
+ধ্রুবক GLOBAL_ROOT = path.join(HOME, '.bpm');
+ধ্রুবক GLOBAL_BIN = IS_WIN
+  ? (process.env.APPDATA
+    ? path.join(process.env.APPDATA, 'bpm')
+    : path.join(HOME, 'AppData', 'Roaming', 'bpm'))
+  : '/usr/local/bin';
+ধ্রুবক GLOBAL_PKGS = path.join(GLOBAL_ROOT, 'globals');
+ধ্রুবক COLOR_ENABLED = detectColorSupport();
+
+ধ্রুবক GLOBAL_BNL_MODULES = IS_WIN
+  ? path.join(process.env.APPDATA || path.join(HOME, 'AppData', 'Roaming'), 'bpm', 'bnl_modules')
+  : '/usr/local/lib/bnl_modules';
+
+ফাংশন detectColorSupport() {
+  ধ্রুবক force = process.env.FORCE_COLOR;
+  যদি (force && force !== '0') ফেরত true;
+  যদি (process.env.NO_COLOR) ফেরত false;
+  যদি (!process.stdout.isTTY) ফেরত false;
+
+  // Windows: enable on modern terminals (Windows Terminal, VS Code, ConEmu), নাহলে off
+  যদি (process.platform === 'win32') {
+    যদি (process.env.WT_SESSION || process.env.TERM_PROGRAM === 'vscode' ||
+      process.env.ConEmuANSI === 'ON' || process.env.ANSICON) {
+      ফেরত true;
+    }
+    // Fallback: powershell/cmd sometimes support ANSI; চেষ্টা to be conservative:
+    ফেরত false;
+  }
+
+  // POSIX
+  ফেরত true;
+}
+
+/* ----------------------------- ANSI Colors -------------------------------- */
+ধ্রুবক COLOR = {
+  reset: COLOR_ENABLED ? '\x1b[0m' : '',
+  bold: COLOR_ENABLED ? '\x1b[1m' : '',
+  dim: COLOR_ENABLED ? '\x1b[2m' : '',
+  gray: COLOR_ENABLED ? '\x1b[90m' : '',
+  red: COLOR_ENABLED ? '\x1b[31m' : '',
+  green: COLOR_ENABLED ? '\x1b[32m' : '',
+  yellow: COLOR_ENABLED ? '\x1b[33m' : '',
+  cyan: COLOR_ENABLED ? '\x1b[36m' : '',
+};
+
+ফাংশন c(s, color) { ফেরত color + s + COLOR.reset; }
+
+/* ------------------------------ Spinner ----------------------------------- */
+ফাংশন createSpinner(prefix = 'working') {
+  ধ্রুবক useSpinner = COLOR_ENABLED && process.stdout.isTTY;
+  ধ্রুবক frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  ধরি i = 0;
+  ধরি text = prefix;
+  ধরি timer = null;
+
+  ফাংশন tick() {
+    যদি (!useSpinner) ফেরত;
+    ধ্রুবক f = frames[i = (i + 1) % frames.length];
+    process.stdout.write(`\r${COLOR.cyan}${f}${COLOR.reset} ${text}   `);
+  }
+
+  ফেরত {
+    start(msg) {
+      text = msg || prefix;
+      যদি (useSpinner && !timer) { timer = setInterval(tick, 80); tick(); }
+      যদি (!useSpinner) দেখান(text + '...');
+    },
+    set(msg) {
+      text = msg;
+      যদি (!useSpinner) দেখান(text + '...');
+      নাহলে tick();
+    },
+    stop(finalMsg, ok = true) {
+      যদি (timer) { clearInterval(timer); timer = null; }
+      যদি (useSpinner) {
+        ধ্রুবক icon = ok ? c('✔', COLOR.green) : c('✖', COLOR.red);
+        ধ্রুবক line = finalMsg ? ` ${finalMsg}` : '';
+        process.stdout.write(`\r${icon}${line}\n`);
+      } নাহলে যদি (finalMsg) {
+        দেখান(finalMsg);
+      }
+    },
+  };
+}
+
+অসমলয় ফাংশন loadConfig() {
+  ধ্রুবক def = { registry: process.env.BPM_REGISTRY || 'https://bpm.bnlang.dev/api', token: null, username: null };
+  অপেক্ষা ensureFile(CFG_PATH, def);
+  ধ্রুবক saved = অপেক্ষা readJSON(CFG_PATH, true) || {};
+  ফেরত Object.assign({}, def, saved);
+}
+
+অসমলয় ফাংশন packProject(cwd) {
+  ধ্রুবক manifestPath = path.join(cwd, "bnl_package.json");
+  ধ্রুবক manifest = অপেক্ষা readJSON(manifestPath);
+  ধ্রুবক name = manifest.name, version = manifest.version;
+  যদি (!name || !version) নিক্ষেপ new Error("bnl_package.json requires name and version");
+
+  ধ্রুবক dist = path.join(cwd, "dist");
+  fs.mkdirSync(dist, { recursive: true });
+
+  ধ্রুবক out = path.join(dist, `${name}-${version}.tgz`);
+
+  // default excludes
+  ধরি excludes = ["bnl_modules", ".git", "dist", ".DS_Store"];
+
+  // load .bpmignore যদি it exists
+  ধ্রুবক ignoreFile = path.join(cwd, ".bpmignore");
+  যদি (fs.existsSync(ignoreFile)) {
+    ধ্রুবক extraIgnores = fs
+      .readFileSync(ignoreFile, "utf8")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"));
+
+    excludes = excludes.concat(extraIgnores);
+  }
+
+  অপেক্ষা compressFolderToTgz(cwd, out, { excludes });
+
+  ধ্রুবক integrity = অপেক্ষা sha512OfFile(out);
+  ফেরত { out, integrity, manifest };
+}
+
+অসমলয় ফাংশন resolveVersion(registry, name, range, token) {
+  ধ্রুবক url = new URL(`/api/packages/${encodeURIComponent(name)}/resolve?range=${encodeURIComponent(range)}`, registry);
+  ধ্রুবক headers = {}; যদি (token) headers['Authorization'] = `Bearer ${token}`;
+  ধ্রুবক res = অপেক্ষা fetch(url, { headers });
+  যদি (!res.ok){
+    নিক্ষেপ new Error(`Resolve failed for ${name}@${range}`);
+  }
+  ফেরত res.json();
+}
+
+অসমলয় ফাংশন safeReadManifest(dir) {
+  প্রতি (ধ্রুবক cand of ['bnl_package.json', 'package.json']) {
+    চেষ্টা {
+      ধ্রুবক m = অপেক্ষা readJSON(path.join(dir, cand), true);
+      যদি (m) ফেরত m;
+    } ধরুন { }
+  }
+  ফেরত null;
+}
+
+অসমলয় ফাংশন installOne({ name, range, destRoot, registry, token, installed, globalInstall, spinner, targetBinDir }) {
+  যদি (!installed[name]) installed[name] = new Set();
+
+  spinner.set(c(`Resolving ${name}@${range}...`, COLOR.dim));
+  ধ্রুবক resolved = অপেক্ষা resolveVersion(registry, name, range, token);
+  যদি (installed[name].has(resolved.version)) {
+    ধ্রুবক existingDir = path.join(destRoot, name);
+    ফেরত { dir: existingDir, version: resolved.version, addedBins: 0 };
+  }
+
+  ধ্রুবক pkgDir = path.join(destRoot, name);
+  fs.mkdirSync(pkgDir, { recursive: true });
+
+  spinner.set(`Downloading ${name}@${resolved.version}…`);
+  ধ্রুবক tmp = path.join(os.tmpdir(), `bpm-${name}-${Date.now()}.tgz`);
+  অপেক্ষা httpGetStreamToFile(resolved.tarball, tmp, token);
+
+  spinner.set(`Extracting ${name}@${resolved.version}…`);
+  অপেক্ষা extractTgz(tmp, pkgDir);
+  চেষ্টা { fs.rmSync(tmp, { force: true }); } ধরুন { }
+
+  installed[name].add(resolved.version);
+
+  // read manifest of the installed package
+  ধ্রুবক manifest = অপেক্ষা safeReadManifest(pkgDir);
+
+  // install sub-deps
+  ধরি subAddedBins = 0;
+  যদি (manifest?.dependencies && typeof manifest.dependencies === 'object') {
+    ধ্রুবক subRoot = path.join(pkgDir, 'bnl_modules');
+    প্রতি (ধ্রুবক [dep, rng] of Object.entries(manifest.dependencies)) {
+      ধ্রুবক r = অপেক্ষা installOne({
+        name: dep,
+        range: rng,
+        destRoot: subRoot,
+        registry,
+        token,
+        installed,
+        globalInstall,
+        spinner,
+        targetBinDir,
+      });
+      subAddedBins += r.addedBins;
+    }
+  }
+
+  // link bins
+  ধরি binsAdded = 0;
+  যদি (manifest?.bin) {
+    binsAdded = অপেক্ষা linkBins(name, manifest.bin, pkgDir, targetBinDir);
+  }
+
+  ফেরত { dir: pkgDir, version: resolved.version, addedBins: binsAdded + subAddedBins };
+}
+
+অসমলয় ফাংশন cmd_login(args, cfg) {
+  ধ্রুবক registry = args.registry || cfg.registry;
+  যদি (!args.username || !args.password) নিক্ষেপ new Error('Use: bpm login -u <username> -p <password>');
+  ধ্রুবক json = অপেক্ষা httpJson(new URL('/api/auth/login', registry), 'POST', { username: args.username, password: args.password });
+  cfg.token = json.token; cfg.username = json.user?.username || args.username;
+  যদি (args.registry) cfg.registry = args.registry;
+  অপেক্ষা saveConfig(CFG_PATH, cfg);
+  দেখান(`Logged in as ${c(cfg.username, COLOR.bold)} to ${c(cfg.registry, COLOR.cyan)}`);
+}
+
+অসমলয় ফাংশন cmd_logout(args, cfg) {
+  cfg.token = null; cfg.username = null; অপেক্ষা saveConfig(CFG_PATH, cfg); দেখান('Logged out.');
+}
+
+অসমলয় ফাংশন cmd_whoami(args, cfg) {
+  অপেক্ষা ensureFile(CFG_PATH, { registry: cfg.registry, token: null, username: null });
+  দেখান('Config:', cfg);
+  যদি (cfg.username && cfg.token) দেখান(c(cfg.username, COLOR.green));
+  নাহলে দেখান(c('Not logged in', COLOR.yellow));
+}
+
+অসমলয় ফাংশন cmd_config(args, cfg) {
+  ধ্রুবক sub = args._[1];
+  যদি (sub === 'get') {
+    ধ্রুবক key = args._[2]; যদি (!key) ফেরত দেখান('');
+    দেখান(cfg[key] ?? '');
+  } নাহলে যদি (sub === 'set') {
+    ধ্রুবক key = args._[2], val = args._[3];
+    যদি (!key) নিক্ষেপ new Error('bpm config set <key> <value>');
+    cfg[key] = val; অপেক্ষা saveConfig(CFG_PATH, cfg); দেখান('ok');
+  } নাহলে {
+    দেখান('Usage: bpm config get <key> | set <key> <value>');
+  }
+}
+
+অসমলয় ফাংশন cmd_pack(args, cfg) {
+  ধ্রুবক { out, integrity } = অপেক্ষা packProject(process.cwd());
+  দেখান(out);
+  দেখান(integrity);
+}
+
+অসমলয় ফাংশন cmd_publish(args, cfg) {
+  ধ্রুবক registry = args.registry || cfg.registry;
+  যদি (!cfg.token) নিক্ষেপ new Error('Please login first');
+  ধ্রুবক { out, integrity, manifest } = অপেক্ষা packProject(process.cwd());
+
+  ধ্রুবক form = new FormData();
+  form.set('name', manifest.name);
+  form.set('version', manifest.version);
+  form.set('integrity', integrity);
+  form.set('meta', JSON.stringify(manifest));
+  ধ্রুবক file = fs.readFileSync(out);
+  form.set('tarball', new Blob([file], { type: 'application/gzip' }), path.basename(out));
+
+  ধ্রুবক url = new URL('/api/packages/publish', registry);
+  ধ্রুবক res = অপেক্ষা fetch(url, { method: 'POST', body: form, headers: { 'Authorization': `Bearer ${cfg.token}` } });
+  যদি (!res.ok) নিক্ষেপ new Error(`Publish failed: ${res.status} ${অপেক্ষা res.text()}`);
+  দেখান('Published', c(manifest.name, COLOR.bold), c(manifest.version, COLOR.cyan));
+}
+
+অসমলয় ফাংশন cmd_search(args, cfg) {
+  ধ্রুবক registry = args.registry || cfg.registry;
+  ধ্রুবক q = args._[1] || '';
+  ধ্রুবক res = অপেক্ষা fetch(new URL('/search?q=' + encodeURIComponent(q), registry), {
+    headers: cfg.token ? { 'Authorization': `Bearer ${cfg.token}` } : {}
+  });
+  যদি (!res.ok) নিক্ষেপ new Error('search failed: ' + res.status);
+  ধ্রুবক arr = অপেক্ষা res.json();
+  প্রতি (ধ্রুবক row of arr) দেখান(`${c(row.name, COLOR.bold)}@${c(row.version, COLOR.cyan)} - ${row.description || ''}`);
+}
+
+ফাংশন readInstalledVersion(dir) {
+  ধ্রুবক m = ['bnl_package.json', 'package.json']
+    .map(f => path.join(dir, f))
+    .find(p => fs.existsSync(p));
+  যদি (!m) ফেরত null;
+  চেষ্টা {
+    ধ্রুবক obj = JSON.parse(fs.readFileSync(m, 'utf8'));
+    ফেরত obj.version || null;
+  } ধরুন { ফেরত null; }
+}
+
+অসমলয় ফাংশন cmd_install(args, cfg) {
+  ধ্রুবক registry = args.registry || cfg.registry;
+  ধ্রুবক token = cfg.token;
+  ধ্রুবক specs = args._.slice(1);
+  ধ্রুবক cwd = process.cwd();
+  ধ্রুবক installedMemo = {};
+  ধ্রুবক spinner = createSpinner('installing…');
+
+  // Summary counters
+  ধ্রুবক summary = { added: 0, updated: 0, removed: 0, bins: 0 };
+  ধ্রুবক changedPackages = [];
+
+  যদি (args.global) {
+    যদি (specs.length === 0) নিক্ষেপ new Error('bpm install -g <name>[@range] ...');
+
+    // ensure dirs
+    fs.mkdirSync(GLOBAL_BNL_MODULES, { recursive: true });
+    fs.mkdirSync(GLOBAL_BIN, { recursive: true });
+
+    spinner.start(c('Preparing global install…', COLOR.dim));
+    প্রতি (ধ্রুবক spec of specs) {
+      ধ্রুবক { name, range } = parseSpec(spec);
+      ধ্রুবক pkgDir = path.join(GLOBAL_BNL_MODULES, name);
+      ধ্রুবক prev = readInstalledVersion(pkgDir);
+
+      spinner.set(`Installing ${name}@${range} (global)…`);
+      ধ্রুবক r = অপেক্ষা installOne({
+        name,
+        range: range || 'latest',
+        destRoot: GLOBAL_BNL_MODULES,
+        registry,
+        token,
+        installed: installedMemo,
+        globalInstall: true,
+        spinner,
+        targetBinDir: GLOBAL_BIN,
+      });
+
+      যদি (!prev) summary.added++;
+      নাহলে যদি (prev !== r.version) summary.updated++;
+      summary.bins += r.addedBins;
+      changedPackages.push({ name, from: prev, to: r.version, where: 'global' });
+
+      দেখান(`${c('installed (global):', COLOR.green)} ${c(name, COLOR.bold)} -> ${r.dir}`);
+    }
+    spinner.stop(c('Global install complete.', COLOR.bold), true);
+
+    printSummary(summary, changedPackages);
+    দেখান('Global binaries in:', c(GLOBAL_BIN, COLOR.cyan));
+    ফেরত;
+  }
+
+  // Local install
+  ধ্রুবক bnlModules = path.join(cwd, 'bnl_modules');
+  fs.mkdirSync(bnlModules, { recursive: true });
+
+  ধরি manifest = অপেক্ষা readJSON(path.join(cwd, 'bnl_package.json'), true);
+  যদি (!manifest) manifest = { name: path.basename(cwd), version: '0.0.0', dependencies: {} };
+  যদি (!manifest.dependencies) manifest.dependencies = {};
+
+  // detect previously installed versions প্রতি these deps
+  ফাংশন prevVersionOf(name) {
+    ফেরত readInstalledVersion(path.join(bnlModules, name));
+  }
+
+  ধ্রুবক toInstall = [];
+  যদি (specs.length === 0) {
+    প্রতি (ধ্রুবক [dep, depRange] of Object.entries(manifest.dependencies)) {
+      toInstall.push({ name: dep, range: depRange });
+    }
+    যদি (toInstall.length === 0) { দেখান('Nothing to install.'); ফেরত; }
+  } নাহলে {
+    প্রতি (ধ্রুবক spec of specs) {
+      ধ্রুবক { name, range } = parseSpec(spec);
+      manifest.dependencies[name] = range || 'latest';
+      toInstall.push({ name, range: range || 'latest' });
+    }
+    অপেক্ষা writeJSON(path.join(cwd, 'bnl_package.json'), manifest);
+    দেখান(c('Updated bnl_package.json', COLOR.dim));
+  }
+
+  spinner.start(c('Resolving & installing dependencies…', COLOR.dim));
+  প্রতি (ধ্রুবক { name, range } of toInstall) {
+    ধ্রুবক prev = prevVersionOf(name);
+
+    spinner.set(`Installing ${name}@${range}…`);
+    ধ্রুবক r = অপেক্ষা installOne({
+      name,
+      range,
+      destRoot: bnlModules,
+      registry,
+      token,
+      installed: installedMemo,
+      globalInstall: false,
+      spinner,
+      targetBinDir: path.join(bnlModules, '.bin'),
+    });
+
+    যদি (!prev) summary.added++;
+    নাহলে যদি (prev !== r.version) summary.updated++;
+    summary.bins += r.addedBins;
+
+    changedPackages.push({ name, from: prev, to: r.version, where: path.relative(cwd, r.dir) || '.' });
+    দেখান(`${c('installed:', COLOR.green)} ${c(name, COLOR.bold)} -> ${path.relative(cwd, r.dir)}`);
+  }
+  spinner.stop(c('Install complete.', COLOR.bold), true);
+
+  printSummary(summary, changedPackages);
+  দেখান(c('Done.', COLOR.green));
+}
+
+অসমলয় ফাংশন cmd_init(args, cfg) {
+  ধ্রুবক cwd = process.cwd();
+  ধ্রুবক manifestPath = path.join(cwd, 'bnl_package.json');
+
+  ধ্রুবক exists = fs.existsSync(manifestPath);
+  ধ্রুবক force = !!args.force || args._.includes('--force') || args._.includes('-f');
+
+  যদি (exists && !force) {
+    দেখান(c('bnl_package.json already exists. Use --force to overwrite.', COLOR.yellow));
+    ফেরত;
+  }
+
+  ধ্রুবক name = path.basename(cwd).replace(/\s+/g, '-').toLowerCase();
+  ধ্রুবক manifest = {
+    name,
+    version: '0.1.0',
+    description: '',
+    scripts: {
+      start: 'bnl index.bnl',
+      test: 'echo "No tests specified" && exit 0'
+    },
+    keywords: [],
+    author: '',
+    license: 'MIT',
+    dependencies: {}
+  };
+
+  অপেক্ষা writeJSON(manifestPath, manifest);
+  দেখান(`${c('Created', COLOR.green)} ${c('bnl_package.json', COLOR.bold)} in ${c(cwd, COLOR.cyan)}`);
+}
+
+ফাংশন printSummary(summary, changedPackages) {
+  // Pretty list of changed packages
+  যদি (changedPackages.length) {
+    দেখান('\nChanges:');
+    প্রতি (ধ্রুবক { name, from, to, where } of changedPackages) {
+      ধ্রুবক tag = from ? (from === to ? c('unchanged', COLOR.gray) : c('updated', COLOR.yellow))
+        : c('added', COLOR.green);
+      ধ্রুবক ver = from ? `${from} → ${to}` : to;
+      দেখান(
+        `  ${c('•', COLOR.cyan)} ${c(name, COLOR.bold)} ${c(ver, COLOR.cyan)} ${c(`(${where})`, COLOR.dim)} ${tag}`
+      );
+    }
+  }
+
+  ধ্রুবক parts = [];
+  যদি (summary.added) parts.push(c(`${summary.added} added`, COLOR.green));
+  যদি (summary.updated) parts.push(c(`${summary.updated} updated`, COLOR.yellow));
+  যদি (summary.removed) parts.push(c(`${summary.removed} removed`, COLOR.red));
+  যদি (summary.bins) parts.push(c(`${summary.bins} bin${summary.bins > 1 ? 's' : ''} linked`, COLOR.cyan));
+  যদি (!parts.length) parts.push(c('0 changes', COLOR.gray));
+  দেখান('\n' + parts.join(', ') + '.\n');
+}
+
+অসমলয় ফাংশন cmd_add(args, cfg) {
+  args._[0] = 'install'; ফেরত cmd_install(args, cfg);
+}
+
+অসমলয় ফাংশন removeDirSafe(p) {
+  চেষ্টা { fs.rmSync(p, { recursive: true, force: true }); } ধরুন { }
+}
+
+অসমলয় ফাংশন cmd_uninstall(args, cfg) {
+  ধ্রুবক specs = args._.slice(1);
+  ধ্রুবক cwd = process.cwd();
+  ধ্রুবক spinner = createSpinner('uninstalling…');
+  ধ্রুবক summary = { added: 0, updated: 0, removed: 0, bins: 0 };
+  ধ্রুবক changed = [];
+
+  যদি (specs.length === 0) {
+    দেখান('Usage: bpm uninstall <name> [-g]');
+    ফেরত;
+  }
+
+  spinner.start(c('Preparing uninstall…', COLOR.dim));
+  প্রতি (ধ্রুবক name of specs) {
+    যদি (args.global) {
+      ধ্রুবক pkgDir = path.join(GLOBAL_BNL_MODULES, name);
+      ধ্রুবক binShim = path.join(GLOBAL_BIN, name + (process.platform === 'win32' ? '.cmd' : ''));
+      ধ্রুবক prev = readInstalledVersion(pkgDir);
+
+      spinner.set(`Removing (global) ${name}…`);
+      অপেক্ষা removeDirSafe(pkgDir);
+      অপেক্ষা removeDirSafe(binShim);
+
+      যদি (prev) { summary.removed++; changed.push({ name, from: prev, to: null, where: 'global' }); }
+      দেখান(`${c('Uninstalled global package:', COLOR.red)} ${c(name, COLOR.bold)}`);
+    } নাহলে {
+      ধ্রুবক pkgDir = path.join(cwd, 'bnl_modules', name);
+      ধ্রুবক binShim = path.join(cwd, 'bnl_modules', '.bin', name + (process.platform === 'win32' ? '.cmd' : ''));
+      ধ্রুবক prev = readInstalledVersion(pkgDir);
+
+      spinner.set(`Removing ${name}…`);
+      অপেক্ষা removeDirSafe(pkgDir);
+      অপেক্ষা removeDirSafe(binShim);
+
+      // remove from manifest
+      ধ্রুবক manifestPath = path.join(cwd, 'bnl_package.json');
+      ধরি manifest = অপেক্ষা readJSON(manifestPath, true);
+      যদি (manifest?.dependencies?.[name]) {
+        delete manifest.dependencies[name];
+        অপেক্ষা writeJSON(manifestPath, manifest);
+        দেখান(`Removed ${c(name, COLOR.bold)} from bnl_package.json`);
+      }
+
+      যদি (prev) { summary.removed++; changed.push({ name, from: prev, to: null, where: path.relative(cwd, pkgDir) }); }
+      দেখান(`${c('Uninstalled local package:', COLOR.red)} ${c(name, COLOR.bold)}`);
+    }
+  }
+  spinner.stop(c('Uninstall complete.', COLOR.bold), true);
+
+  printSummary(summary, changed);
+}
+
+অসমলয় ফাংশন runOneScript(scripts, name) {
+  ধ্রুবক script = scripts?.[name];
+  যদি (!script || typeof script !== 'string') {
+    নিক্ষেপ new Error(`Script "${name}" not found in bnl_package.json`);
+  }
+
+  ধ্রুবক pre = scripts[`pre${name}`];
+  ধ্রুবক post = scripts[`post${name}`];
+
+  ধ্রুবক extra = getExtraArgsAfterDashDash();
+  ধ্রুবক suffix = extra.length ? ' ' + extra.map(a => a.includes(' ') ? `"${a.replace(/"/g, '\\"')}"` : a).join(' ') : '';
+
+  যদি (pre) অপেক্ষা spawnScriptP(pre);
+  অপেক্ষা spawnScriptP(script + suffix);
+  যদি (post) অপেক্ষা spawnScriptP(post);
+}
+
+অসমলয় ফাংশন cmd_run(args, cfg) {
+  ধ্রুবক cwd = process.cwd();
+  ধ্রুবক m = অপেক্ষা safeReadManifest(cwd);
+  যদি (!m) নিক্ষেপ new Error('bnl_package.json not found. Run `bpm init` first.');
+  ধ্রুবক scripts = m.scripts || {};
+
+  ধ্রুবক scriptName = args._[1];
+
+  // If no script specified, list available scripts
+  যদি (!scriptName) {
+    ধ্রুবক names = Object.keys(scripts).filter(k => !/^pre|^post/.test(k));
+    যদি (!names.length) {
+      দেখান('No scripts found in bnl_package.json');
+      ফেরত;
+    }
+    দেখান('Available scripts:\n');
+    প্রতি (ধ্রুবক n of names) {
+      দেখান(`  ${c(n, COLOR.bold)} => ${scripts[n]}`);
+    }
+    দেখান('\nUse: bpm run <script> [-- ...args]');
+    ফেরত;
+  }
+
+  ধ্রুবক spinner = createSpinner('running…');
+  চেষ্টা {
+    অপেক্ষা runOneScript(scripts, scriptName);
+  } ধরুন (e) {
+    spinner.stop(c(`Failed "${scriptName}"`, COLOR.red), false);
+    নিক্ষেপ e;
+  }
+}
+
+অসমলয় ফাংশন main() {
+  ধ্রুবক args = parseArgs(process.argv);
+  ধ্রুবক cfg = অপেক্ষা loadConfig(); // ensures ~/.bpmrc.json
+  ধ্রুবক cmd = args._[0];
+
+  চেষ্টা {
+    যদি (cmd === 'login') অপেক্ষা cmd_login(args, cfg);
+    নাহলে যদি (cmd === 'logout') অপেক্ষা cmd_logout(args, cfg);
+    নাহলে যদি (cmd === 'whoami') অপেক্ষা cmd_whoami(args, cfg);
+    নাহলে যদি (cmd === 'config') অপেক্ষা cmd_config(args, cfg);
+    নাহলে যদি (cmd === 'pack') অপেক্ষা cmd_pack(args, cfg);
+    নাহলে যদি (cmd === 'publish') অপেক্ষা cmd_publish(args, cfg);
+    নাহলে যদি (cmd === 'search') অপেক্ষা cmd_search(args, cfg);
+    নাহলে যদি (cmd === 'install' || cmd === 'i') অপেক্ষা cmd_install(args, cfg);
+    নাহলে যদি (cmd === 'uninstall' || cmd === 'remove' || cmd === 'rm') অপেক্ষা cmd_uninstall(args, cfg);
+    নাহলে যদি (cmd === 'init') অপেক্ষা cmd_init(args, cfg);
+    নাহলে যদি (cmd === 'run') অপেক্ষা cmd_run(args, cfg);
+    নাহলে যদি (cmd === 'add') অপেক্ষা cmd_add(args, cfg);
+    নাহলে যদি (cmd === '-v') দেখান('bpm version', `v${packageJson.version}`);
+    নাহলে যদি (cmd === '--version') দেখান(`v${packageJson.version}`);
+    নাহলে {
+      দেখান(`bpm (CommonJS)
+Usage:
+  bpm init [--force]
+  bpm run <script> [-- ...args]
+  bpm login -u <user> -p <pass>
+  bpm whoami
+  bpm config get <key>
+  bpm config set <key> <value>
+  bpm pack
+  bpm publish
+  bpm search <query>
+  bpm install [-g] [name@range ...]
+  bpm add name@range
+  bpm uninstall <name> [-g]
+
+Env:
+  set BPM_REGISTRY=http://your-registry           (Windows cmd)
+  $env:BPM_REGISTRY="http://your-registry"        (PowerShell)
+  export BPM_REGISTRY=http://your-registry        (bash/zsh)`);
+    }
+  } ধরুন (e) {
+    দেখান(c('Command failed.', COLOR.red));
+    console.error('Error:', e?.message || e);
+    process.exitCode = 1;
+  }
+}
+
+main();
