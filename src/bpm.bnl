@@ -318,6 +318,15 @@
   ধ্রুবক installedMemo = {};
   ধ্রুবক spinner = createSpinner('installing…');
 
+  প্রতি (const spec of specs) {
+    // Get version if not specified
+    যদি (spec.includes('@')) চলুন;
+    ধ্রুবক resolved = অপেক্ষা resolveVersion(registry, spec.trim(), 'latest', token);
+
+    // Replace spec with resolved version
+    specs[specs.indexOf(spec)] = `${spec.trim()}@${resolved.version}`;
+  }
+
   // Summary counters
   ধ্রুবক summary = { added: 0, updated: 0, removed: 0, bins: 0 };
   ধ্রুবক changedPackages = [];

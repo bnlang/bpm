@@ -1,6 +1,6 @@
 {
   "name": "bpm",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "BPM is the official package manager for the Bangla Programming Language (Bnlang). Discover, install, and manage Bnlang libraries and tools easily. Build faster with a reliable, community-driven package ecosystem.",
   "main": "src/bpm.bnl",
   "bin": {
@@ -24,7 +24,5 @@
   "bugs": {
     "url": "https://github.com/bnlang/bpm/issues"
   },
-  "dependencies": {
-    "bpm": "latest"
-  }
+  "dependencies": {}
 }
