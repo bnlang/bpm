@@ -34,6 +34,43 @@ Verify:
 bpm --help
 ```
 
+### Cross-build for all platforms
+
+bpm is pure Go (no cgo), so cross-compilation works from any host. The repo ships scripts that produce stripped, version-stamped binaries for every supported platform — each one packed into a `.zip` archive with a single `bpm` (or `bpm.exe`) executable at the root:
+
+```sh
+# Linux / macOS
+./build.sh                  # all six targets
+./build.sh windows-x64      # one target only
+
+# Windows
+.\build.ps1
+.\build.ps1 windows-x64
+```
+
+Output layout matches the platform strings bpm uses elsewhere:
+
+| Target | Output | Archive contents |
+|---|---|---|
+| `windows-x64` | `dist/bpm-windows-x64.zip` | `bpm.exe` |
+| `windows-x86` | `dist/bpm-windows-x86.zip` | `bpm.exe` |
+| `linux-x64` | `dist/bpm-linux-x64.zip` | `bpm` |
+| `linux-arm64` | `dist/bpm-linux-arm64.zip` | `bpm` |
+| `darwin-x64` | `dist/bpm-darwin-x64.zip` (Intel Macs) | `bpm` |
+| `darwin-arm64` | `dist/bpm-darwin-arm64.zip` (Apple Silicon) | `bpm` |
+
+Each archive is ~3.3–3.7 MB compressed (~8–9 MB uncompressed). Users download one zip, unpack it, drop the binary onto `PATH`, done.
+
+Override the version stamp with `VERSION=v1.0.0 ./build.sh` (or `$env:VERSION = "v1.0.0"; .\build.ps1`) when cutting a release. The scripts use `CGO_ENABLED=0`, `-trimpath`, and `-ldflags="-s -w"` so the resulting binaries are static.
+
+`build.sh` requires the `zip` command (preinstalled on most Linux/macOS hosts; `apt install zip` / `brew install zip` if missing). `build.ps1` uses the built-in `Compress-Archive`, no extra tooling required.
+
+For a single ad-hoc build with no packaging, the underlying command is:
+
+```sh
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bpm .
+```
+
 ---
 
 ## Quick start
