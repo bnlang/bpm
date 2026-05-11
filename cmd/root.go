@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -27,6 +28,13 @@ func init() {
 		"registry URL (env: BPM_REGISTRY)")
 	rootCmd.PersistentFlags().BoolVarP(&flagQuiet, "quiet", "q", false,
 		"suppress non-error output")
+}
+
+// SetVersion is called from main() to wire the ldflags-injected version
+// into cobra so `bpm --version` and `bpm -v` print it.
+func SetVersion(version, buildDate string) {
+	rootCmd.Version = fmt.Sprintf("%s (built %s)", version, buildDate)
+	rootCmd.SetVersionTemplate("bpm {{.Version}}\n")
 }
 
 func Execute() error {
