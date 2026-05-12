@@ -33,7 +33,7 @@ func init() {
 // SetVersion is called from main() to wire the ldflags-injected version
 // into cobra so `bpm --version` and `bpm -v` print it.
 func SetVersion(version, buildDate string) {
-	rootCmd.Version = fmt.Sprintf("%s (built %s)", version, buildDate)
+	rootCmd.Version = fmt.Sprintf("%s (Bnlang)", version)
 	rootCmd.SetVersionTemplate("bpm {{.Version}}\n")
 }
 

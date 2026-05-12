@@ -24,7 +24,7 @@ var initCmd = &cobra.Command{
 		}
 		m := &manifest.Manifest{
 			Name:         filepath.Base(cwd),
-			Version:      "0.1.0",
+			Version:      "1.0.0",
 			Description:  "",
 			Main:         "index.bnl",
 			Dependencies: map[string]string{},
