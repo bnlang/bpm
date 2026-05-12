@@ -3,6 +3,7 @@ package registry
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -11,6 +12,33 @@ import (
 	"path/filepath"
 	"time"
 )
+
+// RegistryError is the typed error returned by every Client request that
+// reached the server and got back a non-2xx status. Callers can use
+// errors.As / IsConflict / IsStatus to branch on the code without parsing
+// strings.
+type RegistryError struct {
+	StatusCode int
+	Status     string // e.g. "409 Conflict"
+	Message    string // server-supplied error message, may be empty
+}
+
+func (e *RegistryError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("%s: %s", e.Status, e.Message)
+	}
+	return e.Status
+}
+
+// IsConflict reports whether err is a 409 Conflict from the registry.
+// Used by `bpm publish` to treat a repeat upload as "already published, skip".
+func IsConflict(err error) bool {
+	var re *RegistryError
+	if errors.As(err, &re) {
+		return re.StatusCode == http.StatusConflict
+	}
+	return false
+}
 
 type Client struct {
 	BaseURL string
@@ -109,10 +137,15 @@ func readError(res *http.Response) error {
 	var ej struct {
 		Error string `json:"error"`
 	}
+	msg := string(b)
 	if json.Unmarshal(b, &ej) == nil && ej.Error != "" {
-		return fmt.Errorf("%s: %s", res.Status, ej.Error)
+		msg = ej.Error
 	}
-	return fmt.Errorf("%s: %s", res.Status, string(b))
+	return &RegistryError{
+		StatusCode: res.StatusCode,
+		Status:     res.Status,
+		Message:    msg,
+	}
 }
 
 func (c *Client) Signup(username, email, password string) (*AuthResponse, error) {

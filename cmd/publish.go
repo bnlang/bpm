@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -45,17 +46,24 @@ Native packages declare per-platform binary paths via "targets":
     }
   }
 
-The CLI picks targets[<platform>], takes that file's enclosing directory as
-the package root (sibling DLLs come along), and renames the binary itself to
-the canonical <name>.<ext>. Use --binary to override per invocation.`,
+By default, ` + "`bpm publish`" + ` on a native package uploads every platform in
+` + "`targets`" + ` in one go — pre-flighting that each binary exists on disk, then
+posting one tarball per platform. Repeating the command is idempotent: any
+platform already on the registry at this version is skipped (409 → skip).
+
+Pass --platform <name> to narrow to a single platform (handy for CI matrix
+runs, or to retry one missing platform). Pass --binary to override the path
+read from targets[<platform>].`,
 	RunE: runPublish,
 }
 
 func init() {
 	publishCmd.Flags().StringVar(&publishPlatform, "platform", "",
-		"asset platform (lib | windows-x64 | linux-x64 | darwin-arm64 | ...)")
+		"asset platform (lib | windows-x64 | linux-x64 | darwin-arm64 | ...). "+
+			"If empty for a native package, every platform in `targets` is published.")
 	publishCmd.Flags().StringVar(&publishBinary, "binary", "",
-		"path to the built plugin binary (overrides targets.<platform>)")
+		"path to the built plugin binary (overrides targets.<platform>). "+
+			"Requires --platform.")
 	rootCmd.AddCommand(publishCmd)
 }
 
@@ -81,57 +89,149 @@ func runPublish(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	kind := m.Kind()
-
-	tmp, err := os.CreateTemp("", "bpm-publish-*.tar.gz")
-	if err != nil {
-		return err
-	}
-	tmp.Close()
-	tarball := tmp.Name()
-	defer os.Remove(tarball)
-
 	matcher, err := archive.LoadBpmIgnore(projectDir)
 	if err != nil {
 		return fmt.Errorf("loading .bpmignore: %w", err)
 	}
 
-	var platform_ string
-	if kind == "lib" {
-		platform_ = "lib"
-		if _, _, err := archive.PackDirWithIgnore(projectDir, tarball, matcher); err != nil {
-			return err
-		}
-	} else {
-		if publishPlatform == "" {
-			publishPlatform = platform.Current()
-		}
-		platform_ = publishPlatform
-
-		binary, err := resolveNativeBinary(m, projectDir, publishPlatform)
-		if err != nil {
-			return err
-		}
-		if err := packNative(projectDir, m, binary, matcher, tarball); err != nil {
-			return err
-		}
-	}
-
 	meta := registry.PublishMetadata{
-		Kind:         kind,
+		Kind:         m.Kind(),
 		Dependencies: m.Dependencies,
 		Description:  m.Description,
 		License:      m.License,
 		Homepage:     m.Homepage,
 		Repository:   m.Repository,
 	}
-	res, err := c.Publish(m.Name, m.Version, platform_, tarball, meta)
+
+	if m.Kind() == "lib" {
+		return publishLibPackage(c, m, projectDir, matcher, meta)
+	}
+	return publishNativePackage(c, m, projectDir, matcher, meta)
+}
+
+func publishLibPackage(c *registry.Client, m *manifest.Manifest, projectDir string,
+	matcher archive.IgnoreMatcher, meta registry.PublishMetadata) error {
+
+	tarball, err := makeTempTarball()
 	if err != nil {
 		return err
 	}
-	info("published %s@%s (%s) — %d bytes — %s",
+	defer os.Remove(tarball)
+
+	if _, _, err := archive.PackDirWithIgnore(projectDir, tarball, matcher); err != nil {
+		return err
+	}
+	res, err := c.Publish(m.Name, m.Version, "lib", tarball, meta)
+	if err != nil {
+		if registry.IsConflict(err) {
+			info("nothing to publish: %s@%s is already on the registry.", m.Name, m.Version)
+			info("bump \"version\" in bnl.json to publish a new release.")
+			return nil
+		}
+		return err
+	}
+	info("publish  %s@%s  (%s)  — %d bytes — %s",
 		res.Name, res.Version, res.Platform, res.SizeBytes, res.Integrity)
 	return nil
+}
+
+func publishNativePackage(c *registry.Client, m *manifest.Manifest, projectDir string,
+	matcher archive.IgnoreMatcher, meta registry.PublishMetadata) error {
+
+	if publishBinary != "" && publishPlatform == "" {
+		publishPlatform = platform.Current()
+	}
+
+	var platforms []string
+	if publishPlatform != "" {
+		platforms = []string{publishPlatform}
+	} else {
+		if len(m.Targets) == 0 {
+			return fmt.Errorf("native publish: manifest has no `targets` map.\n" +
+				"Add a `targets` entry to bnl.json, or pass --platform + --binary.")
+		}
+		platforms = make([]string, 0, len(m.Targets))
+		for p := range m.Targets {
+			platforms = append(platforms, p)
+		}
+		sort.Strings(platforms)
+	}
+
+	type job struct {
+		plat string
+		bin  string
+	}
+	jobs := make([]job, 0, len(platforms))
+	var missing []string
+	for _, plat := range platforms {
+		bin, err := resolveNativeBinary(m, projectDir, plat)
+		if err != nil {
+			return err
+		}
+		if _, err := os.Stat(bin); err != nil {
+			rel, relErr := filepath.Rel(projectDir, bin)
+			if relErr != nil || strings.HasPrefix(rel, "..") {
+				rel = bin
+			}
+			missing = append(missing, fmt.Sprintf("  %-14s %s", plat, rel))
+			continue
+		}
+		jobs = append(jobs, job{plat: plat, bin: bin})
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf(
+			"missing binaries for %s@%s:\n%s\n"+
+				"build them first (e.g. .\\build.ps1 on Windows or ./build.sh on Linux/macOS), "+
+				"then re-run bpm publish.",
+			m.Name, m.Version, strings.Join(missing, "\n"))
+	}
+
+	published, skipped := 0, 0
+	for _, j := range jobs {
+		tarball, err := makeTempTarball()
+		if err != nil {
+			return err
+		}
+		if err := packNative(projectDir, m, j.bin, matcher, tarball); err != nil {
+			os.Remove(tarball)
+			return err
+		}
+		res, err := c.Publish(m.Name, m.Version, j.plat, tarball, meta)
+		os.Remove(tarball)
+		if err != nil {
+			if registry.IsConflict(err) {
+				info("skip     %s@%s  (%s)  — already published", m.Name, m.Version, j.plat)
+				skipped++
+				continue
+			}
+			return fmt.Errorf("publish %s/%s: %w", m.Name, j.plat, err)
+		}
+		info("publish  %s@%s  (%s)  — %d bytes — %s",
+			res.Name, res.Version, res.Platform, res.SizeBytes, res.Integrity)
+		published++
+	}
+
+	total := len(jobs)
+	switch {
+	case published == 0 && skipped == total:
+		info("nothing to publish: %s@%s already has all %d platform(s) on the registry.",
+			m.Name, m.Version, total)
+		info("bump \"version\" in bnl.json to publish a new release.")
+	case skipped == 0:
+		info("done: %d platform(s) published", published)
+	default:
+		info("done: %d platform(s) published, %d already up", published, skipped)
+	}
+	return nil
+}
+
+func makeTempTarball() (string, error) {
+	tmp, err := os.CreateTemp("", "bpm-publish-*.tar.gz")
+	if err != nil {
+		return "", err
+	}
+	tmp.Close()
+	return tmp.Name(), nil
 }
 
 func resolveNativeBinary(m *manifest.Manifest, projectDir, plat string) (string, error) {
