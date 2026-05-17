@@ -19,6 +19,7 @@ type Manifest struct {
 	Dependencies map[string]string `json:"dependencies,omitempty"`
 
 	Targets map[string]string `json:"targets,omitempty"`
+	Files   []string          `json:"files,omitempty"`
 }
 
 const Filename = "bnl.json"

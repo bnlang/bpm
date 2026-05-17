@@ -23,7 +23,11 @@ func LoadBpmIgnore(dir string) (IgnoreMatcher, error) {
 	if err != nil {
 		return nil, err
 	}
-	return func(rel string, _ bool) bool {
-		return gi.MatchesPath(filepath.ToSlash(rel))
+	return func(rel string, isDir bool) bool {
+		p := filepath.ToSlash(rel)
+		if isDir {
+			p += "/"
+		}
+		return gi.MatchesPath(p)
 	}, nil
 }

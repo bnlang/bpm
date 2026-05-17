@@ -195,12 +195,13 @@ func verifyIntegrity(path, want string) error {
 func normalizeNativeManifest(depDir, depName string) error {
 	m, err := manifest.Load(depDir)
 	if err != nil {
-		fname := platform.LibraryFilename(depName)
 		return manifest.Save(depDir, &manifest.Manifest{
 			Name:   depName,
-			Native: fname,
+			Native: platform.LibraryFilename(depName),
 		})
 	}
-	m.Native = platform.LibraryFilename(depName)
+	if m.Native == "" {
+		m.Native = platform.LibraryFilename(depName)
+	}
 	return manifest.Save(depDir, m)
 }

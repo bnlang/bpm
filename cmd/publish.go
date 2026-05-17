@@ -53,7 +53,15 @@ platform already on the registry at this version is skipped (409 → skip).
 
 Pass --platform <name> to narrow to a single platform (handy for CI matrix
 runs, or to retry one missing platform). Pass --binary to override the path
-read from targets[<platform>].`,
+read from targets[<platform>].
+
+What ships in a native tarball:
+  - bnl.json (rewritten — native = target path, targets dropped)
+  - README* / LICENSE* / NOTICES* at the project root
+  - The "main" file (and its containing dir if main is in a subdir)
+  - Every regular file under build/<platform>/ (binary's own directory)
+  - Anything matched by "files" in bnl.json (globs, dirs recurse)
+  - Minus any path matched by .bpmignore`,
 	RunE: runPublish,
 }
 
@@ -192,7 +200,7 @@ func publishNativePackage(c *registry.Client, m *manifest.Manifest, projectDir s
 		if err != nil {
 			return err
 		}
-		if err := packNative(projectDir, m, j.bin, matcher, tarball); err != nil {
+		if err := packNative(projectDir, m, j.plat, j.bin, matcher, tarball); err != nil {
 			os.Remove(tarball)
 			return err
 		}
@@ -250,7 +258,7 @@ func resolveNativeBinary(m *manifest.Manifest, projectDir, plat string) (string,
 	return filepath.Join(projectDir, filepath.FromSlash(rel)), nil
 }
 
-func packNative(projectDir string, m *manifest.Manifest, binary string, matcher archive.IgnoreMatcher, dst string) error {
+func packNative(projectDir string, m *manifest.Manifest, plat, binary string, matcher archive.IgnoreMatcher, dst string) error {
 	binSt, err := os.Stat(binary)
 	if err != nil {
 		return fmt.Errorf("binary: %w", err)
@@ -258,10 +266,13 @@ func packNative(projectDir string, m *manifest.Manifest, binary string, matcher 
 	if binSt.IsDir() {
 		return fmt.Errorf("binary %s is a directory", binary)
 	}
+	nativeRel := m.Targets[plat]
+	if nativeRel == "" {
+		nativeRel = platform.LibraryFilename(m.Name)
+	}
+	nativeRel = filepath.ToSlash(filepath.Clean(filepath.FromSlash(nativeRel)))
 
 	binDir := filepath.Dir(binary)
-	binaryBase := filepath.Base(binary)
-	canonical := platform.LibraryFilename(m.Name)
 
 	tmpdir, err := os.MkdirTemp("", "bpm-pack-*")
 	if err != nil {
@@ -273,43 +284,127 @@ func packNative(projectDir string, m *manifest.Manifest, binary string, matcher 
 		if err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(binDir, path)
-		if err != nil {
-			return err
+		rel, err := filepath.Rel(projectDir, path)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			return nil
 		}
 		if rel == "." {
 			return nil
 		}
-		var dstName string
-		if rel == binaryBase {
-			dstName = canonical
-		} else {
-			dstName = rel
-		}
-
-		if matcher != nil && matcher(dstName, info.IsDir()) {
+		if matcher != nil && matcher(rel, info.IsDir()) {
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-
-		target := filepath.Join(tmpdir, dstName)
-		if info.IsDir() {
-			return os.MkdirAll(target, info.Mode())
-		}
-		if !info.Mode().IsRegular() {
+		if info.IsDir() || !info.Mode().IsRegular() {
 			return nil
 		}
-		return copyFile(path, target)
+		return copyFile(path, filepath.Join(tmpdir, rel))
 	})
 	if walkErr != nil {
 		return fmt.Errorf("staging bin dir %s: %w", binDir, walkErr)
 	}
 
-	if readme := findReadme(projectDir); readme != "" {
-		if err := copyFile(readme, filepath.Join(tmpdir, filepath.Base(readme))); err != nil {
-			return fmt.Errorf("staging readme: %w", err)
+	binTarget := filepath.Join(tmpdir, filepath.FromSlash(nativeRel))
+	if _, err := os.Stat(binTarget); err != nil {
+		if err := copyFile(binary, binTarget); err != nil {
+			return fmt.Errorf("staging binary: %w", err)
+		}
+	}
+
+	rootEntries, _ := os.ReadDir(projectDir)
+	for _, e := range rootEntries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		upper := strings.ToUpper(name)
+		if !(strings.HasPrefix(upper, "README") ||
+			strings.HasPrefix(upper, "LICENSE") ||
+			strings.HasPrefix(upper, "NOTICES")) {
+			continue
+		}
+		if matcher != nil && matcher(name, false) {
+			continue
+		}
+		if err := copyFile(filepath.Join(projectDir, name),
+			filepath.Join(tmpdir, name)); err != nil {
+			return fmt.Errorf("staging %s: %w", name, err)
+		}
+	}
+
+	if m.Main != "" {
+		mainAbs := filepath.Join(projectDir, filepath.FromSlash(m.Main))
+		if st, err := os.Stat(mainAbs); err == nil && !st.IsDir() {
+			mainDir := filepath.Dir(mainAbs)
+			if mainDir == projectDir {
+				if matcher == nil || !matcher(m.Main, false) {
+					if err := copyFile(mainAbs, filepath.Join(tmpdir, m.Main)); err != nil {
+						return fmt.Errorf("staging main: %w", err)
+					}
+				}
+			} else {
+				mainWalkErr := filepath.Walk(mainDir, func(path string, info os.FileInfo, err error) error {
+					if err != nil || info.IsDir() {
+						return err
+					}
+					rel, err := filepath.Rel(projectDir, path)
+					if err != nil {
+						return err
+					}
+					if matcher != nil && matcher(rel, false) {
+						return nil
+					}
+					return copyFile(path, filepath.Join(tmpdir, rel))
+				})
+				if mainWalkErr != nil {
+					return fmt.Errorf("staging main dir: %w", mainWalkErr)
+				}
+			}
+		}
+	}
+
+	for _, pat := range m.Files {
+		abs := filepath.Join(projectDir, filepath.FromSlash(pat))
+		matches, err := filepath.Glob(abs)
+		if err != nil {
+			return fmt.Errorf("files pattern %q: %w", pat, err)
+		}
+		for _, mp := range matches {
+			rel, err := filepath.Rel(projectDir, mp)
+			if err != nil || strings.HasPrefix(rel, "..") {
+				continue
+			}
+			st, err := os.Stat(mp)
+			if err != nil {
+				continue
+			}
+			if st.IsDir() {
+				walkErr := filepath.Walk(mp, func(path string, info os.FileInfo, werr error) error {
+					if werr != nil || info.IsDir() {
+						return werr
+					}
+					childRel, err := filepath.Rel(projectDir, path)
+					if err != nil {
+						return err
+					}
+					if matcher != nil && matcher(childRel, false) {
+						return nil
+					}
+					return copyFile(path, filepath.Join(tmpdir, childRel))
+				})
+				if walkErr != nil {
+					return fmt.Errorf("files walk %q: %w", pat, walkErr)
+				}
+			} else {
+				if matcher != nil && matcher(rel, false) {
+					continue
+				}
+				if err := copyFile(mp, filepath.Join(tmpdir, rel)); err != nil {
+					return fmt.Errorf("staging %s: %w", rel, err)
+				}
+			}
 		}
 	}
 
@@ -320,14 +415,16 @@ func packNative(projectDir string, m *manifest.Manifest, binary string, matcher 
 		License:      m.License,
 		Homepage:     m.Homepage,
 		Repository:   m.Repository,
-		Native:       canonical,
+		Main:         m.Main,
+		Native:       nativeRel,
 		Dependencies: m.Dependencies,
+		Files:        m.Files,
 	}
 	if err := manifest.Save(tmpdir, staged); err != nil {
 		return err
 	}
 
-	_, _, err = archive.PackDir(tmpdir, dst)
+	_, _, err = archive.PackTree(tmpdir, dst)
 	return err
 }
 
@@ -347,23 +444,4 @@ func copyFile(src, dst string) error {
 	defer out.Close()
 	_, err = io.Copy(out, in)
 	return err
-}
-
-func findReadme(projectDir string) string {
-	entries, err := os.ReadDir(projectDir)
-	if err != nil {
-		return ""
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		base := e.Name()
-		ext := strings.ToLower(filepath.Ext(base))
-		stem := strings.ToLower(strings.TrimSuffix(base, ext))
-		if stem == "readme" {
-			return filepath.Join(projectDir, base)
-		}
-	}
-	return ""
 }

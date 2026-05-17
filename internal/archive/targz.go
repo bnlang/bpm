@@ -15,6 +15,9 @@ import (
 func PackDir(srcDir, dst string) (integrity string, size int64, err error) {
 	return PackDirWithIgnore(srcDir, dst, nil)
 }
+func PackTree(srcDir, dst string) (integrity string, size int64, err error) {
+	return packTreeRaw(srcDir, dst)
+}
 
 func PackDirWithIgnore(srcDir, dst string, extra IgnoreMatcher) (integrity string, size int64, err error) {
 	out, err := os.Create(dst)
@@ -142,6 +145,66 @@ func UnpackTo(src, dst string) error {
 		default:
 		}
 	}
+}
+
+func packTreeRaw(srcDir, dst string) (integrity string, size int64, err error) {
+	out, err := os.Create(dst)
+	if err != nil {
+		return "", 0, err
+	}
+	defer out.Close()
+
+	hasher := sha256.New()
+	gzw := gzip.NewWriter(io.MultiWriter(out, hasher))
+	tw := tar.NewWriter(gzw)
+
+	walkErr := filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(srcDir, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		hdr, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		hdr.Name = filepath.ToSlash(rel)
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(tw, f)
+		return err
+	})
+	if walkErr != nil {
+		return "", 0, walkErr
+	}
+	if err := tw.Close(); err != nil {
+		return "", 0, err
+	}
+	if err := gzw.Close(); err != nil {
+		return "", 0, err
+	}
+	if err := out.Close(); err != nil {
+		return "", 0, err
+	}
+	st, err := os.Stat(dst)
+	if err != nil {
+		return "", 0, err
+	}
+	return "sha256-" + hex.EncodeToString(hasher.Sum(nil)), st.Size(), nil
 }
 
 func shouldSkip(rel string) bool {
