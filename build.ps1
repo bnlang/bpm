@@ -21,7 +21,7 @@ $targets = @(
 $outDir = if ($env:OUT_DIR) { $env:OUT_DIR } else { "dist" }
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
-$version = if ($env:VERSION) { $env:VERSION } else { "1.0.0" }
+$version = if ($env:VERSION) { $env:VERSION } else { "1.1.0" }
 
 $date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 $ldflags = "-s -w -X main.Version=$version -X main.BuildDate=$date"

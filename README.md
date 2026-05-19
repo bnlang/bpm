@@ -61,7 +61,7 @@ Output layout matches the platform strings bpm uses elsewhere:
 
 Each archive is ~3.3–3.7 MB compressed (~8–9 MB uncompressed). Users download one zip, unpack it, drop the binary onto `PATH`, done.
 
-Override the version stamp with `VERSION=v1.0.0 ./build.sh` (or `$env:VERSION = "v1.0.0"; .\build.ps1`) when cutting a release. The scripts use `CGO_ENABLED=0`, `-trimpath`, and `-ldflags="-s -w"` so the resulting binaries are static.
+Override the version stamp with `VERSION=v1.1.0 ./build.sh` (or `$env:VERSION = "v1.1.0"; .\build.ps1`) when cutting a release. The scripts use `CGO_ENABLED=0`, `-trimpath`, and `-ldflags="-s -w"` so the resulting binaries are static.
 
 `build.sh` requires the `zip` command (preinstalled on most Linux/macOS hosts; `apt install zip` / `brew install zip` if missing). `build.ps1` uses the built-in `Compress-Archive`, no extra tooling required.
 
@@ -146,7 +146,7 @@ Global flags accepted by every command:
     "repository": "https://github.com/example/mathx",
     "main": "src/index.bnl",
     "dependencies": {
-        "core-utils": "^1.0.0",
+        "core-utils": "^1.1.0",
         "logger":     "~0.4"
     }
 }
@@ -188,7 +188,7 @@ The installed manifest (under `deps/<name>/bnl.json`) replaces `targets` with a 
         "logger": {
             "version":   "0.4.7",
             "integrity": "sha256-abcd1234…",
-            "deps":      { "core-utils": "^1.0.0" }
+            "deps":      { "core-utils": "^1.1.0" }
         }
     }
 }
