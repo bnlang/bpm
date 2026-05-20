@@ -215,7 +215,7 @@ func (c *Client) GetVersion(name, version string) (*Version, error) {
 	return &out, nil
 }
 
-func (c *Client) DownloadAsset(name, version, platform, dst string) (int64, error) {
+func (c *Client) DownloadAsset(name, version, platform, dst string, onProgress ProgressFunc) (int64, error) {
 	url := fmt.Sprintf("%s/v1/p/%s/%s/asset/%s", c.BaseURL, name, version, platform)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -237,7 +237,15 @@ func (c *Client) DownloadAsset(name, version, platform, dst string) (int64, erro
 		return 0, err
 	}
 	defer out.Close()
-	return io.Copy(out, res.Body)
+	var src io.Reader = res.Body
+	if onProgress != nil {
+		src = &progressReader{r: res.Body, total: res.ContentLength, cb: onProgress}
+	}
+	n, err := io.Copy(out, src)
+	if err == nil && onProgress != nil {
+		onProgress(n, n)
+	}
+	return n, err
 }
 
 type PublishMetadata struct {
@@ -257,11 +265,35 @@ type PublishResponse struct {
 	SizeBytes int64  `json:"size_bytes"`
 }
 
-func (c *Client) Publish(name, version, platform, tarballPath string, meta PublishMetadata) (*PublishResponse, error) {
+type ProgressFunc func(sent, total int64)
+
+type progressReader struct {
+	r     io.Reader
+	sent  int64
+	total int64
+	cb    ProgressFunc
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.sent += int64(n)
+		p.cb(p.sent, p.total)
+	}
+	return n, err
+}
+
+func (c *Client) Publish(name, version, platform, tarballPath string, meta PublishMetadata, onProgress ProgressFunc) (*PublishResponse, error) {
 	mb, err := json.Marshal(meta)
 	if err != nil {
 		return nil, err
 	}
+
+	st, err := os.Stat(tarballPath)
+	if err != nil {
+		return nil, err
+	}
+	total := st.Size()
 
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
@@ -281,7 +313,11 @@ func (c *Client) Publish(name, version, platform, tarballPath string, meta Publi
 			return
 		}
 		defer f.Close()
-		if _, err := io.Copy(fw, f); err != nil {
+		var src io.Reader = f
+		if onProgress != nil {
+			src = &progressReader{r: f, total: total, cb: onProgress}
+		}
+		if _, err := io.Copy(fw, src); err != nil {
 			pw.CloseWithError(err)
 			return
 		}

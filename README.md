@@ -132,6 +132,12 @@ Global flags accepted by every command:
 - `--registry <url>` — override the registry for this invocation (overrides `BPM_REGISTRY`).
 - `-q`, `--quiet` — suppress non-error output.
 
+### `bpm install` flags
+
+- `-g`, `--global` — install into `~/.bnl/deps/` instead of `./deps/`.
+- `-f`, `--force` — reinstall registry packages even if `deps/<name>/bnl.json` already reports the requested version. By default a no-op `bpm install` skips already-installed packages and prints `→ name@version (cached)`; `--force` re-downloads and re-unpacks every one. Local `file:` dependencies are always re-unpacked regardless.
+- `--ignore-failed` — keep going when an individual package fails. The failing package is skipped (no `bnl.json` / `bnl.lock` entry written for it) and a summary of skipped packages is printed at the end. The default is strict — any failure aborts the whole install.
+
 ---
 
 ## The `bnl.json` manifest

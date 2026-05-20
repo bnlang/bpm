@@ -24,6 +24,7 @@ import (
 var (
 	flagGlobal       bool
 	flagIgnoreFailed bool
+	flagForce        bool
 )
 
 var installCmd = &cobra.Command{
@@ -54,6 +55,8 @@ func init() {
 	installCmd.Flags().BoolVarP(&flagGlobal, "global", "g", false, "install into ~/.bnl/deps")
 	installCmd.Flags().BoolVar(&flagIgnoreFailed, "ignore-failed", false,
 		"skip packages that fail to install instead of aborting")
+	installCmd.Flags().BoolVarP(&flagForce, "force", "f", false,
+		"reinstall registry packages even if already present at the requested version")
 	rootCmd.AddCommand(installCmd)
 }
 
@@ -311,6 +314,11 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		}
 		successPlan := plan[:0]
 		for _, r := range plan {
+			if !flagForce && alreadyInstalled(depsDir, r) {
+				info("→ %s@%s (cached)", r.Name, r.Version)
+				successPlan = append(successPlan, r)
+				continue
+			}
 			info("→ %s@%s", r.Name, r.Version)
 			if err := downloadAndUnpack(c, r, depsDir); err != nil {
 				if !flagIgnoreFailed {
@@ -402,6 +410,14 @@ func resolvePerRoot(c *registry.Client, registrySpecs map[string]string, failed 
 	return plan, failed
 }
 
+func alreadyInstalled(depsDir string, r resolver.Resolved) bool {
+	m, err := manifest.Load(filepath.Join(depsDir, r.Name))
+	if err != nil {
+		return false
+	}
+	return m.Version == r.Version
+}
+
 func downloadAndUnpack(c *registry.Client, r resolver.Resolved, depsDir string) error {
 	tmp, err := os.CreateTemp("", "bpm-*.tar.gz")
 	if err != nil {
@@ -414,7 +430,8 @@ func downloadAndUnpack(c *registry.Client, r resolver.Resolved, depsDir string) 
 	if r.Kind == "native" {
 		assetPlat = platform.Current()
 	}
-	if _, err := c.DownloadAsset(r.Name, r.Version, assetPlat, tmp.Name()); err != nil {
+	if _, err := c.DownloadAsset(r.Name, r.Version, assetPlat, tmp.Name(),
+		progressBar(fmt.Sprintf("Installing %s@%s (%s)", r.Name, r.Version, assetPlat))); err != nil {
 		return fmt.Errorf("downloading %s@%s: %w", r.Name, r.Version, err)
 	}
 	if err := verifyIntegrity(tmp.Name(), r.Integrity); err != nil {

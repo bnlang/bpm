@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -129,7 +130,8 @@ func publishLibPackage(c *registry.Client, m *manifest.Manifest, projectDir stri
 	if _, _, err := archive.PackDirWithIgnore(projectDir, tarball, matcher); err != nil {
 		return err
 	}
-	res, err := c.Publish(m.Name, m.Version, "lib", tarball, meta)
+	res, err := c.Publish(m.Name, m.Version, "lib", tarball, meta,
+		progressBar(fmt.Sprintf("Publishing %s@%s (lib)", m.Name, m.Version)))
 	if err != nil {
 		if registry.IsConflict(err) {
 			info("nothing to publish: %s@%s is already on the registry.", m.Name, m.Version)
@@ -204,7 +206,8 @@ func publishNativePackage(c *registry.Client, m *manifest.Manifest, projectDir s
 			os.Remove(tarball)
 			return err
 		}
-		res, err := c.Publish(m.Name, m.Version, j.plat, tarball, meta)
+		res, err := c.Publish(m.Name, m.Version, j.plat, tarball, meta,
+			progressBar(fmt.Sprintf("Publishing %s@%s (%s)", m.Name, m.Version, j.plat)))
 		os.Remove(tarball)
 		if err != nil {
 			if registry.IsConflict(err) {
@@ -426,6 +429,46 @@ func packNative(projectDir string, m *manifest.Manifest, plat, binary string, ma
 
 	_, _, err = archive.PackTree(tmpdir, dst)
 	return err
+}
+
+func progressBar(label string) registry.ProgressFunc {
+	if flagQuiet {
+		return nil
+	}
+	var lastTick time.Time
+	return func(sent, total int64) {
+		done := total > 0 && sent >= total
+		if !done && time.Since(lastTick) < 100*time.Millisecond {
+			return
+		}
+		lastTick = time.Now()
+		if total > 0 {
+			pct := float64(sent) / float64(total) * 100
+			fmt.Fprintf(os.Stderr, "\r%s — %s / %s (%.1f%%)   ",
+				label, fmtBytes(sent), fmtBytes(total), pct)
+		} else {
+			fmt.Fprintf(os.Stderr, "\r%s — %s   ", label, fmtBytes(sent))
+		}
+		if done {
+			fmt.Fprintln(os.Stderr)
+		}
+	}
+}
+
+func fmtBytes(n int64) string {
+	const k = 1024.0
+	f := float64(n)
+	if f < k {
+		return fmt.Sprintf("%d B", n)
+	}
+	units := []string{"KB", "MB", "GB", "TB"}
+	i := 0
+	f /= k
+	for f >= k && i < len(units)-1 {
+		f /= k
+		i++
+	}
+	return fmt.Sprintf("%.2f %s", f, units[i])
 }
 
 func copyFile(src, dst string) error {
