@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -44,6 +45,7 @@ type Client struct {
 	BaseURL string
 	Token   string
 	HTTP    *http.Client
+	Stream  *http.Client
 }
 
 func New(baseURL, token string) *Client {
@@ -51,6 +53,23 @@ func New(baseURL, token string) *Client {
 		BaseURL: baseURL,
 		Token:   token,
 		HTTP:    &http.Client{Timeout: 60 * time.Second},
+		Stream:  newStreamClient(),
+	}
+}
+
+func newStreamClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   30 * time.Second,
+			ResponseHeaderTimeout: 5 * time.Minute,
+			ExpectContinueTimeout: 1 * time.Second,
+			IdleConnTimeout:       90 * time.Second,
+		},
 	}
 }
 
@@ -221,7 +240,7 @@ func (c *Client) DownloadAsset(name, version, platform, dst string, onProgress P
 	if err != nil {
 		return 0, err
 	}
-	res, err := c.HTTP.Do(req)
+	res, err := c.Stream.Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -246,6 +265,20 @@ func (c *Client) DownloadAsset(name, version, platform, dst string, onProgress P
 		onProgress(n, n)
 	}
 	return n, err
+}
+
+type UploadURL struct {
+	URL       string `json:"url"`
+	Method    string `json:"method"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+func (c *Client) GetUploadURL(name, version string) (*UploadURL, error) {
+	var out UploadURL
+	if err := c.doJSON("GET", "/v1/p/"+name+"/"+version+"/upload-url", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 type PublishMetadata struct {
@@ -294,6 +327,15 @@ func (c *Client) Publish(name, version, platform, tarballPath string, meta Publi
 		return nil, err
 	}
 	total := st.Size()
+	url := fmt.Sprintf("%s/v1/p/%s/%s", c.BaseURL, name, version)
+	if up, err := c.GetUploadURL(name, version); err == nil && up.URL != "" {
+		url = up.URL
+	} else if err != nil {
+		var re *RegistryError
+		if !errors.As(err, &re) || re.StatusCode != http.StatusNotFound {
+			return nil, err
+		}
+	}
 
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
@@ -323,7 +365,6 @@ func (c *Client) Publish(name, version, platform, tarballPath string, meta Publi
 		}
 	}()
 
-	url := fmt.Sprintf("%s/v1/p/%s/%s", c.BaseURL, name, version)
 	req, err := http.NewRequest("POST", url, pr)
 	if err != nil {
 		return nil, err
@@ -333,7 +374,7 @@ func (c *Client) Publish(name, version, platform, tarballPath string, meta Publi
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
 
-	res, err := c.HTTP.Do(req)
+	res, err := c.Stream.Do(req)
 	if err != nil {
 		return nil, err
 	}
