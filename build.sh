@@ -23,7 +23,7 @@ mkdir -p "$OUT_DIR"
 
 # Default release version. Override with `VERSION=1.2.3 ./build.sh` when
 # cutting a different release.
-VERSION="${VERSION:-1.2.0}"
+VERSION="${VERSION:-1.3.0}"
 DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 LDFLAGS="-s -w -X main.Version=${VERSION} -X main.BuildDate=${DATE}"

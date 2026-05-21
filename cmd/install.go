@@ -25,6 +25,8 @@ var (
 	flagGlobal       bool
 	flagIgnoreFailed bool
 	flagForce        bool
+	flagPlatformsCSV string
+	flagOptional     bool
 )
 
 var installCmd = &cobra.Command{
@@ -57,6 +59,12 @@ func init() {
 		"skip packages that fail to install instead of aborting")
 	installCmd.Flags().BoolVarP(&flagForce, "force", "f", false,
 		"reinstall registry packages even if already present at the requested version")
+	installCmd.Flags().StringVar(&flagPlatformsCSV, "platforms", "",
+		"comma-separated platforms this dep applies to (e.g. windows-x64,linux-x64). "+
+			"Outside this list, the dep is ignored. Implies the object form in bnl.json.")
+	installCmd.Flags().BoolVarP(&flagOptional, "optional", "O", false,
+		"tolerate install failure (missing asset / no version) with a warning instead of aborting. "+
+			"Implies the object form in bnl.json.")
 	rootCmd.AddCommand(installCmd)
 }
 
@@ -91,12 +99,42 @@ func reportFailed(failed []failedPkg) {
 	}
 }
 
+func reportSkippedOptionals(skipped []resolver.Skipped) {
+	if len(skipped) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\nskipped %d optional package(s):\n", len(skipped))
+	for _, s := range skipped {
+		fmt.Fprintf(os.Stderr, "  %s: %s\n", s.Name, s.Reason)
+	}
+}
+
+// parsePlatformsCSV splits a "win-x64,linux-x64" string into a slice, trimming
+// blanks. Returns nil when the input is empty.
+func parsePlatformsCSV(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 type localInstallResult struct {
 	Name         string
 	Version      string
 	Kind         string
 	Integrity    string
-	Dependencies map[string]string
+	Dependencies map[string]manifest.DepSpec
 	SpecPath     string // path stored back into bnl.json (without "file:" prefix)
 	SourceAbs    string // directory used as the base for resolving this package's own file: deps
 }
@@ -110,10 +148,11 @@ type localWork struct {
 func runInstall(cmd *cobra.Command, args []string) error {
 	var (
 		depsDir    string
-		rootSpecs  map[string]string
+		rootSpecs  map[string]manifest.DepSpec
 		projectDir string
 		projManif  *manifest.Manifest
 		failed     []failedPkg
+		skipped    []resolver.Skipped
 
 		// Pending single-arg add: applied to the manifest only on success.
 		pendingRegistryName     string
@@ -122,6 +161,9 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		pendingLocalName        string
 		pendingLocalSpec        string
 	)
+
+	cliPlatforms := parsePlatformsCSV(flagPlatformsCSV)
+	cliScoped := len(cliPlatforms) > 0 || flagOptional
 
 	if flagGlobal {
 		depsDir = paths.GlobalDepsDir()
@@ -143,7 +185,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		if projManif.Dependencies == nil {
-			projManif.Dependencies = map[string]string{}
+			projManif.Dependencies = map[string]manifest.DepSpec{}
 		}
 	}
 
@@ -188,15 +230,21 @@ func runInstall(cmd *cobra.Command, args []string) error {
 
 	if flagGlobal {
 		name, spec, _ := splitNameVersion(args[0])
-		rootSpecs = map[string]string{name: spec}
+		rootSpecs = map[string]manifest.DepSpec{
+			name: {Version: spec, Platforms: cliPlatforms, Optional: flagOptional},
+		}
 	} else {
-		rootSpecs = map[string]string{}
+		rootSpecs = map[string]manifest.DepSpec{}
 		for n, s := range projManif.Dependencies {
 			rootSpecs[n] = s
 		}
 		if len(args) == 1 && !isLocalSpec(args[0]) {
 			name, spec, explicit := splitNameVersion(args[0])
-			rootSpecs[name] = spec
+			rootSpecs[name] = manifest.DepSpec{
+				Version:   spec,
+				Platforms: cliPlatforms,
+				Optional:  flagOptional,
+			}
 			pendingRegistryName = name
 			pendingRegistrySpec = spec
 			pendingRegistryExplicit = explicit
@@ -212,7 +260,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	for _, p := range preInstalledLocals {
 		done[p.Name] = true
 	}
-	registrySpecs := map[string]string{}
+	registrySpecs := map[string]manifest.DepSpec{}
 	var queue []localWork
 
 	// Seed from the consumer's root specs.
@@ -220,8 +268,8 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		if done[n] {
 			continue
 		}
-		if strings.HasPrefix(s, "file:") {
-			queue = append(queue, localWork{baseDir: projectDir, spec: s, expectedName: n})
+		if strings.HasPrefix(s.Version, "file:") {
+			queue = append(queue, localWork{baseDir: projectDir, spec: s.Version, expectedName: n})
 		} else {
 			registrySpecs[n] = s
 		}
@@ -235,8 +283,8 @@ func runInstall(cmd *cobra.Command, args []string) error {
 			if _, inRoot := rootSpecs[cn]; inRoot {
 				continue
 			}
-			if strings.HasPrefix(cs, "file:") {
-				queue = append(queue, localWork{baseDir: p.SourceAbs, spec: cs, expectedName: cn})
+			if strings.HasPrefix(cs.Version, "file:") {
+				queue = append(queue, localWork{baseDir: p.SourceAbs, spec: cs.Version, expectedName: cn})
 			} else if _, exists := registrySpecs[cn]; !exists {
 				registrySpecs[cn] = cs
 			}
@@ -287,8 +335,8 @@ func runInstall(cmd *cobra.Command, args []string) error {
 			if done[cn] {
 				continue
 			}
-			if strings.HasPrefix(cs, "file:") {
-				queue = append(queue, localWork{baseDir: res.SourceAbs, spec: cs, expectedName: cn})
+			if strings.HasPrefix(cs.Version, "file:") {
+				queue = append(queue, localWork{baseDir: res.SourceAbs, spec: cs.Version, expectedName: cn})
 			} else if _, exists := registrySpecs[cn]; !exists {
 				registrySpecs[cn] = cs
 			}
@@ -302,12 +350,14 @@ func runInstall(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		if flagIgnoreFailed {
-			plan, failed = resolvePerRoot(c, registrySpecs, failed)
+			plan, failed, skipped = resolvePerRoot(c, registrySpecs, failed, skipped)
 		} else {
-			plan, err = resolver.Resolve(c, registrySpecs)
+			var sk []resolver.Skipped
+			plan, sk, err = resolver.Resolve(c, registrySpecs)
 			if err != nil {
 				return err
 			}
+			skipped = append(skipped, sk...)
 		}
 		if err := paths.EnsureDir(depsDir); err != nil {
 			return err
@@ -321,6 +371,11 @@ func runInstall(cmd *cobra.Command, args []string) error {
 			}
 			info("→ %s@%s", r.Name, r.Version)
 			if err := downloadAndUnpack(c, r, depsDir); err != nil {
+				if r.Optional {
+					warnSkip(fmt.Sprintf("%s@%s (optional)", r.Name, r.Version), err)
+					skipped = append(skipped, resolver.Skipped{Name: r.Name, Reason: err.Error()})
+					continue
+				}
 				if !flagIgnoreFailed {
 					return err
 				}
@@ -334,20 +389,43 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	}
 
 	if !flagGlobal {
+		recordRegistry := func(name, spec string) {
+			if cliScoped {
+				projManif.AddScopedDep(name, spec, cliPlatforms, flagOptional)
+			} else {
+				projManif.AddDep(name, spec)
+			}
+		}
 		if pendingRegistryName != "" {
+			recorded := false
 			for _, r := range plan {
 				if r.Name == pendingRegistryName {
 					if pendingRegistryExplicit {
-						projManif.AddDep(pendingRegistryName, pendingRegistrySpec)
+						recordRegistry(pendingRegistryName, pendingRegistrySpec)
 					} else {
-						projManif.AddDep(pendingRegistryName, "^"+r.Version)
+						recordRegistry(pendingRegistryName, "^"+r.Version)
 					}
+					recorded = true
 					break
 				}
 			}
+			// If the planned install was skipped (e.g. optional + no asset for
+			// this platform), still record the intent so reinstalls elsewhere
+			// behave consistently.
+			if !recorded && cliScoped {
+				spec := pendingRegistrySpec
+				if !pendingRegistryExplicit {
+					spec = "*"
+				}
+				recordRegistry(pendingRegistryName, spec)
+			}
 		}
 		if pendingLocalName != "" {
-			projManif.AddDep(pendingLocalName, pendingLocalSpec)
+			if cliScoped {
+				projManif.AddScopedDep(pendingLocalName, pendingLocalSpec, cliPlatforms, flagOptional)
+			} else {
+				projManif.AddDep(pendingLocalName, pendingLocalSpec)
+			}
 		}
 		if err := manifest.Save(projectDir, projManif); err != nil {
 			return err
@@ -368,7 +446,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 				Kind:         lr.Kind,
 				Integrity:    lr.Integrity,
 				Resolved:     "file:" + lr.SpecPath,
-				Dependencies: lr.Dependencies,
+				Dependencies: flattenDepSpecs(lr.Dependencies),
 			}
 		}
 		if err := l.Save(projectDir); err != nil {
@@ -379,10 +457,13 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	total := len(plan) + len(localResults)
 	info("installed %d package(s) into %s", total, depsDir)
 	reportFailed(failed)
+	reportSkippedOptionals(skipped)
 	return nil
 }
 
-func resolvePerRoot(c *registry.Client, registrySpecs map[string]string, failed []failedPkg) ([]resolver.Resolved, []failedPkg) {
+func resolvePerRoot(c *registry.Client, registrySpecs map[string]manifest.DepSpec,
+	failed []failedPkg, skipped []resolver.Skipped) ([]resolver.Resolved, []failedPkg, []resolver.Skipped) {
+
 	names := make([]string, 0, len(registrySpecs))
 	for n := range registrySpecs {
 		names = append(names, n)
@@ -393,12 +474,13 @@ func resolvePerRoot(c *registry.Client, registrySpecs map[string]string, failed 
 	var plan []resolver.Resolved
 	for _, n := range names {
 		spec := registrySpecs[n]
-		p, err := resolver.Resolve(c, map[string]string{n: spec})
+		p, sk, err := resolver.Resolve(c, map[string]manifest.DepSpec{n: spec})
 		if err != nil {
 			warnSkip(n, err)
-			failed = append(failed, failedPkg{name: n, spec: spec, err: err})
+			failed = append(failed, failedPkg{name: n, spec: spec.Version, err: err})
 			continue
 		}
+		skipped = append(skipped, sk...)
 		for _, r := range p {
 			if seen[r.Name] {
 				continue
@@ -407,7 +489,20 @@ func resolvePerRoot(c *registry.Client, registrySpecs map[string]string, failed 
 			plan = append(plan, r)
 		}
 	}
-	return plan, failed
+	return plan, failed, skipped
+}
+
+// flattenDepSpecs reduces the rich manifest map to the flat name→version map
+// the lockfile stores.
+func flattenDepSpecs(m map[string]manifest.DepSpec) map[string]string {
+	if len(m) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v.Version
+	}
+	return out
 }
 
 func alreadyInstalled(depsDir string, r resolver.Resolved) bool {

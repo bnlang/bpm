@@ -137,6 +137,8 @@ Global flags accepted by every command:
 - `-g`, `--global` — install into `~/.bnl/deps/` instead of `./deps/`.
 - `-f`, `--force` — reinstall registry packages even if `deps/<name>/bnl.json` already reports the requested version. By default a no-op `bpm install` skips already-installed packages and prints `→ name@version (cached)`; `--force` re-downloads and re-unpacks every one. Local `file:` dependencies are always re-unpacked regardless.
 - `--ignore-failed` — keep going when an individual package fails. The failing package is skipped (no `bnl.json` / `bnl.lock` entry written for it) and a summary of skipped packages is printed at the end. The default is strict — any failure aborts the whole install.
+- `--platforms <list>` — comma-separated platforms the dep applies to (e.g. `windows-x64,darwin-arm64,darwin-x64`). Writes the dep as a scoped object in `bnl.json` (see [Platform-scoped dependencies](#platform-scoped-dependencies) below). On any platform outside the list the dep is ignored — not installed, not in the lockfile, no warning. On listed platforms it remains required, so a missing registry asset is still a hard error.
+- `-O`, `--optional` — tolerate install failure (no version match, no asset for this platform, network error) with a warning instead of aborting. Writes the dep as a scoped object with `"optional": true`. Use this for best-effort deps where you actively *want* to be told it didn't install but don't want it to break the build. Pair with `--platforms` to be both scoped *and* lenient inside the scope.
 
 ---
 
@@ -159,6 +161,43 @@ Global flags accepted by every command:
 ```
 
 Required: `name`. Everything else is optional; only `name`, `main`, and `native` are read by the Bnlang runtime itself — bpm uses the rest for the registry.
+
+### Platform-scoped dependencies
+
+A dependency value can be a plain version string **or** an object that scopes the dep to specific platforms and/or marks it as best-effort:
+
+```json
+{
+    "dependencies": {
+        "torch-bnlang": "^1.1.0",
+
+        "onnxruntime-genai-bnlang": {
+            "version":   "^0.1.0",
+            "platforms": ["windows-x64", "darwin-arm64", "darwin-x64"]
+        },
+
+        "fast-tokenizer-bnlang": {
+            "version":  "^0.3.0",
+            "optional": true
+        }
+    }
+}
+```
+
+Two independent fields:
+
+- **`platforms`** — *where this dep applies*. Outside the listed platforms the dep is silently ignored: not resolved, not installed, not in the lockfile. On listed platforms it's required as normal.
+- **`optional`** — *whether failure is tolerable*. When `true`, an install failure (no asset for this platform, no version satisfying the spec, network error) becomes a warning instead of aborting. Both fields can be combined.
+
+| `platforms` set? | current platform listed? | `optional`? | behavior |
+|---|---|---|---|
+| no | — | no | required everywhere (default) |
+| no | — | yes | tried everywhere; warn-skip on failure |
+| yes | yes | no | required here; hard error on failure |
+| yes | yes | yes | tried here; warn-skip on failure |
+| yes | no | — | not applicable, silent |
+
+Use `--platforms` / `-O` on `bpm install <name>` to write either field via the CLI — no need to hand-edit `bnl.json`.
 
 ### Native plugins — `targets`
 

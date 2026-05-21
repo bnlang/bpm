@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"bpm/internal/manifest"
 )
 
 // RegistryError is the typed error returned by every Client request that
@@ -91,12 +93,12 @@ type Asset struct {
 }
 
 type Version struct {
-	Name         string            `json:"name"`
-	Version      string            `json:"version"`
-	Kind         string            `json:"kind"`
-	Dependencies map[string]string `json:"dependencies"`
-	PublishedAt  time.Time         `json:"published_at"`
-	Assets       []Asset           `json:"assets"`
+	Name         string                      `json:"name"`
+	Version      string                      `json:"version"`
+	Kind         string                      `json:"kind"`
+	Dependencies map[string]manifest.DepSpec `json:"dependencies"`
+	PublishedAt  time.Time                   `json:"published_at"`
+	Assets       []Asset                     `json:"assets"`
 }
 
 type PackageInfo struct {
@@ -282,12 +284,12 @@ func (c *Client) GetUploadURL(name, version string) (*UploadURL, error) {
 }
 
 type PublishMetadata struct {
-	Kind         string            `json:"kind"`
-	Dependencies map[string]string `json:"dependencies"`
-	Description  string            `json:"description,omitempty"`
-	License      string            `json:"license,omitempty"`
-	Homepage     string            `json:"homepage,omitempty"`
-	Repository   string            `json:"repository,omitempty"`
+	Kind         string                      `json:"kind"`
+	Dependencies map[string]manifest.DepSpec `json:"dependencies"`
+	Description  string                      `json:"description,omitempty"`
+	License      string                      `json:"license,omitempty"`
+	Homepage     string                      `json:"homepage,omitempty"`
+	Repository   string                      `json:"repository,omitempty"`
 }
 
 type PublishResponse struct {

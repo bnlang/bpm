@@ -3,6 +3,8 @@ package resolver
 import (
 	"fmt"
 
+	"bpm/internal/manifest"
+	"bpm/internal/platform"
 	"bpm/internal/registry"
 	"bpm/internal/semvr"
 )
@@ -14,12 +16,76 @@ type Resolved struct {
 	Integrity    string
 	URL          string
 	Dependencies map[string]string
+	Optional     bool
 }
 
-func Resolve(c *registry.Client, root map[string]string) ([]Resolved, error) {
-	specs := map[string][]string{}
-	for n, s := range root {
-		specs[n] = append(specs[n], s)
+type Skipped struct {
+	Name   string
+	Reason string
+}
+
+type effective struct {
+	specs     []string
+	platforms map[string]bool
+	optional  bool
+}
+
+func (e *effective) merge(d manifest.DepSpec, firstSeen bool) {
+	e.specs = appendUnique(e.specs, d.Version)
+	if firstSeen {
+		e.optional = d.Optional
+	} else if !d.Optional {
+		// A non-optional parent demand wins: dep becomes required.
+		e.optional = false
+	}
+	if len(d.Platforms) == 0 {
+		// "All platforms" widens to all.
+		e.platforms = nil
+		return
+	}
+	if !firstSeen && e.platforms == nil {
+		// Already widened to all — stay there.
+		return
+	}
+	if firstSeen {
+		e.platforms = map[string]bool{}
+	}
+	for _, p := range d.Platforms {
+		e.platforms[p] = true
+	}
+}
+
+func (e *effective) appliesTo(plat string) bool {
+	if e.platforms == nil {
+		return true
+	}
+	return e.platforms[plat]
+}
+
+func Resolve(c *registry.Client, root map[string]manifest.DepSpec) ([]Resolved, []Skipped, error) {
+	plat := platform.Current()
+
+	state := map[string]*effective{}
+	queue := []string{}
+	enqueue := func(name string, d manifest.DepSpec) {
+		s, ok := state[name]
+		if !ok {
+			s = &effective{}
+			state[name] = s
+			s.merge(d, true)
+			if s.appliesTo(plat) {
+				queue = append(queue, name)
+			}
+			return
+		}
+		s.merge(d, false)
+		if s.appliesTo(plat) {
+			queue = append(queue, name)
+		}
+	}
+
+	for n, d := range root {
+		enqueue(n, d)
 	}
 
 	versionsCache := map[string][]string{}
@@ -40,27 +106,33 @@ func Resolve(c *registry.Client, root map[string]string) ([]Resolved, error) {
 	}
 
 	resolved := map[string]Resolved{}
-	queue := []string{}
-	for n := range specs {
-		queue = append(queue, n)
-	}
+	var skipped []Skipped
 
 	for len(queue) > 0 {
 		name := queue[0]
 		queue = queue[1:]
 
+		eff := state[name]
+		if !eff.appliesTo(plat) {
+			continue
+		}
+
 		avail, err := availableVersions(name)
 		if err != nil {
-			return nil, fmt.Errorf("fetching %s: %w", name, err)
+			if eff.optional {
+				skipped = appendSkipped(skipped, name, err.Error())
+				continue
+			}
+			return nil, nil, fmt.Errorf("fetching %s: %w", name, err)
 		}
 
 		picked := ""
 		for _, candidate := range descendingVersions(avail) {
 			ok := true
-			for _, spec := range specs[name] {
+			for _, spec := range eff.specs {
 				rng, err := semvr.Range(spec)
 				if err != nil {
-					return nil, fmt.Errorf("bad spec for %s: %w", name, err)
+					return nil, nil, fmt.Errorf("bad spec for %s: %w", name, err)
 				}
 				v, err := semverParse(candidate)
 				if err != nil {
@@ -78,7 +150,12 @@ func Resolve(c *registry.Client, root map[string]string) ([]Resolved, error) {
 			}
 		}
 		if picked == "" {
-			return nil, fmt.Errorf("no version of %s satisfies %v", name, specs[name])
+			msg := fmt.Sprintf("no version of %s satisfies %v", name, eff.specs)
+			if eff.optional {
+				skipped = appendSkipped(skipped, name, msg)
+				continue
+			}
+			return nil, nil, fmt.Errorf("%s", msg)
 		}
 
 		if old, ok := resolved[name]; ok && old.Version == picked {
@@ -87,13 +164,22 @@ func Resolve(c *registry.Client, root map[string]string) ([]Resolved, error) {
 
 		ver, err := c.GetVersion(name, picked)
 		if err != nil {
-			return nil, fmt.Errorf("fetching %s@%s: %w", name, picked, err)
+			if eff.optional {
+				skipped = appendSkipped(skipped, name, err.Error())
+				continue
+			}
+			return nil, nil, fmt.Errorf("fetching %s@%s: %w", name, picked, err)
 		}
 
 		integrity, url := pickAsset(c, ver)
 		if integrity == "" {
-			return nil, fmt.Errorf("%s@%s has no asset for platform %s",
+			msg := fmt.Sprintf("%s@%s has no asset for platform %s",
 				name, picked, currentAssetPlatformFor(ver.Kind))
+			if eff.optional {
+				skipped = appendSkipped(skipped, name, msg)
+				continue
+			}
+			return nil, nil, fmt.Errorf("%s", msg)
 		}
 
 		resolved[name] = Resolved{
@@ -102,14 +188,12 @@ func Resolve(c *registry.Client, root map[string]string) ([]Resolved, error) {
 			Kind:         ver.Kind,
 			Integrity:    integrity,
 			URL:          url,
-			Dependencies: copyMap(ver.Dependencies),
+			Dependencies: flattenSpecs(ver.Dependencies),
+			Optional:     eff.optional,
 		}
 
 		for childName, childSpec := range ver.Dependencies {
-			if !contains(specs[childName], childSpec) {
-				specs[childName] = append(specs[childName], childSpec)
-				queue = append(queue, childName)
-			}
+			enqueue(childName, childSpec)
 		}
 	}
 
@@ -117,7 +201,7 @@ func Resolve(c *registry.Client, root map[string]string) ([]Resolved, error) {
 	for _, r := range resolved {
 		out = append(out, r)
 	}
-	return out, nil
+	return out, skipped, nil
 }
 
 func pickAsset(c *registry.Client, v *registry.Version) (integrity, url string) {
@@ -131,22 +215,28 @@ func pickAsset(c *registry.Client, v *registry.Version) (integrity, url string) 
 	return "", ""
 }
 
-func contains(xs []string, x string) bool {
+func appendUnique(xs []string, x string) []string {
 	for _, s := range xs {
 		if s == x {
-			return true
+			return xs
 		}
 	}
-	return false
+	return append(xs, x)
 }
 
-func copyMap(m map[string]string) map[string]string {
-	if len(m) == 0 {
-		return map[string]string{}
+func appendSkipped(xs []Skipped, name, reason string) []Skipped {
+	for _, s := range xs {
+		if s.Name == name {
+			return xs
+		}
 	}
+	return append(xs, Skipped{Name: name, Reason: reason})
+}
+
+func flattenSpecs(m map[string]manifest.DepSpec) map[string]string {
 	out := make(map[string]string, len(m))
 	for k, v := range m {
-		out[k] = v
+		out[k] = v.Version
 	}
 	return out
 }

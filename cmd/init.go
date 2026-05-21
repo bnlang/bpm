@@ -27,7 +27,7 @@ var initCmd = &cobra.Command{
 			Version:      "1.1.0",
 			Description:  "",
 			Main:         "index.bnl",
-			Dependencies: map[string]string{},
+			Dependencies: map[string]manifest.DepSpec{},
 		}
 		if err := manifest.Save(cwd, m); err != nil {
 			return err
